@@ -1,5 +1,5 @@
-# backup_siteground
-Utility to backup websites created on SiteGround.com
+# sg_backup
+Utility to backup websites hosted on SiteGround.com
 
 This backup utility pulls from SiteGround by running an ssh mysqldump into a local file to collect WordPress database
 and by running an rsync against the next-oldest backup (if one exists, else use rsync to populate new) for website
