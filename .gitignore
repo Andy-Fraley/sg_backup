@@ -5,6 +5,7 @@ README.txt
 venv*
 .DS_Store
 vault.yml
+.y4zwCKnyBvoPevYX
 
 # Any files in local tmp or backup directories
 tmp/
