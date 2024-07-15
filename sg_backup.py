@@ -14,6 +14,7 @@ import re
 from enum import Enum
 import locale
 import logging
+import logging.handlers
 import pathlib
 import json
 from pathlib import Path
@@ -121,7 +122,8 @@ def process(
     logging_formatter = logging.Formatter('%(asctime)s %(levelname)s\t%(message)s', '%Y-%m-%d %H:%M:%S')
 
     # Log into central messages files in the backups directory
-    file_handler = logging.FileHandler(g.backups_dir_path + '/messages.log')
+    file_handler = logging.handlers.RotatingFileHandler(g.backups_dir_path + '/messages.log', maxBytes=10000000, \
+        backupCount=1)
     file_handler.setLevel(logging.DEBUG) # Into log files, write everything including DEBUG messages
     file_handler.setFormatter(logging_formatter)
     root_logger.addHandler(file_handler)
