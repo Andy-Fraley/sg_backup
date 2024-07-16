@@ -565,9 +565,9 @@ def retrieve_html_files(site_name, site_data, existing_backups):
         log_string += ' (can take a while since this is first rsync retrieval)'
     logging.info(log_string)
     rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
-        ' -i ' + str(site_data['ssh_key_file']) + '" "' + str(site_data['ssh_username']) + '@' + \
-        site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + '/www/' + site_data['site_hostname'] + \
-        '/public_html/*" "' + html_files_dir + '"'
+        ' -i ' + Path.home() + '/.ssh/' + str(site_data['ssh_key_file']) + '" "' + str(site_data['ssh_username']) + \
+        '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + '/www/' + \
+        site_data['site_hostname'] + '/public_html/*" "' + html_files_dir + '"'
     logging.debug(f'Executing: {rsync_string}')
     try:
         exec_output = subprocess.check_output(rsync_string, stderr=subprocess.STDOUT, shell=True)
@@ -581,7 +581,7 @@ def dump_db(site_name, site_data):
     global g
 
     logging.info(f'Starting database dump for site {site_name}')
-    mykey = paramiko.RSAKey.from_private_key_file(site_data['ssh_key_file'],
+    mykey = paramiko.RSAKey.from_private_key_file(Path.home() + '/.ssh/' + site_data['ssh_key_file'],
         site_data['ssh_key_passphrase'])
     client = paramiko.SSHClient()
     client.load_system_host_keys()
@@ -596,8 +596,8 @@ def dump_db(site_name, site_data):
     logging.debug(f'DB dump now under /tmp on server. Will do rsync to retrieve it')
     db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/db/database.sql'
     rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
-        ' -i ' + str(site_data['ssh_key_file']) + '" "' + str(site_data['ssh_username']) + '@' + \
-        site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + '/tmp/database.sql' + \
+        ' -i ' + Path.home() + '/.ssh/' + str(site_data['ssh_key_file']) + '" "' + str(site_data['ssh_username']) + \
+        '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + '/tmp/database.sql' + \
         '" "' + db_dump_filename + '"'
     logging.debug(f'Executing: {rsync_string}')
     try:
