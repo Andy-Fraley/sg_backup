@@ -581,8 +581,8 @@ def dump_db(site_name, site_data):
     global g
 
     logging.info(f'Starting database dump for site {site_name}')
-    mykey = paramiko.RSAKey.from_private_key_file(Path.home() + '/.ssh/' + site_data['ssh_key_file'],
-        site_data['ssh_key_passphrase'])
+    mykey = paramiko.RSAKey.from_private_key_file(str(Path.home()) + '/.ssh/' + str(site_data['ssh_key_file']),
+        str(site_data['ssh_key_passphrase']))
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     client.connect(site_data['ssh_hostname'], username=site_data['ssh_username'], pkey=mykey,
