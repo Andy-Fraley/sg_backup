@@ -205,8 +205,8 @@ def process(
     # Confirm required credentials provided for each site needed for backup access
     for site_name in sites_data:
         sites_data[site_name]['do_mysql_backup'] = confirm_keys(vault_file, sites_data, site_name, \
-            ['ssh_key_file', 'ssh_hostname', 'ssh_username',
-             'ssh_key_passphrase', 'ssh_port', 'mysql_user', 'mysql_password', 'mysql_db', 'backup_intervals'])
+            ['ssh_hostname', 'ssh_username', 'ssh_port', 'mysql_user', 'mysql_password', 'mysql_db', \
+             'backup_intervals'])
 
     # Now, do the backups (if enough time has transpired that a new backup is required per site backup schedules)
     g.did_a_backup = False
