@@ -160,8 +160,9 @@ def process(
     if use_keyring:
         vault_password = keyring.get_password('backup_siteground', 'default')
         if not vault_password:
-            logging.error('Use ./specify_vault_password.py to set password if you intend to use keyring')
-            exit(1)
+            err_string = 'Use ./specify_vault_password.py to set password if you intend to use keyring'
+            logging.error(err_string)
+            raise Exception(err_string)
     elif os.path.isfile(program_path + '/.y4zwCKnyBvoPevYX'):
         with open(program_path + '/.y4zwCKnyBvoPevYX', 'r') as f:
             vault_password = f.readline().strip()
@@ -172,14 +173,16 @@ def process(
     vault_data = vault.load(open(vault_file_path).read())
     if not no_email:
         if not 'gmail' in vault_data:
-            logging.error(f"'gmail' is a required section in {vault_file_path} file")
-            exit(1)
+            err_string = f"'gmail' is a required section in {vault_file_path} file"
+            logging.error(err_string)
+            raise Exception(err_string)
         vault_data_gmail = vault_data['gmail']
         if not 'user' in vault_data_gmail or not 'password' in vault_data_gmail \
             or not 'notify_target' in vault_data_gmail:
-            logging.error(f"'user', 'password', and 'notify_target' are all required parameters in " \
-                f"the 'gmail' section of {vault_file_path} file")
-            exit(1)
+            err_string = f"'user', 'password', and 'notify_target' are all required parameters in " \
+                f"the 'gmail' section of {vault_file_path} file"
+            logging.error(err_string)
+            raise Exception(err_string)
         g.gmail_user = vault_data_gmail['user']
         g.gmail_password = vault_data_gmail['password']
         g.notification_target_email = vault_data_gmail['notify_target']
@@ -194,8 +197,9 @@ def process(
                 logging.error(f'Cannot find credentials in vault file for site {site}')
                 abort = True
         if abort:
-            logging.error('Aborting...')
-            exit(1)
+            err_string = 'Cannot find credentials in vault file for site(s).  Aborting...'
+            logging.error(err_string)
+            raise Exception(err_string)
         sites_data = dict((x, sites_data[x]) for x in backup_site)
 
     # Confirm required credentials provided for each site needed for backup access
@@ -242,9 +246,10 @@ def get_backup_schedule(site_data):
     backup_schedule = {}
     for backup_interval in site_data['backup_intervals']:
         if backup_interval not in BACKUP_INTERVALS.keys():
-            logging.error(f"Specified backup interval, '{backup_interval}', must be one of: " \
+            err_string = f"Specified backup interval, '{backup_interval}', must be one of: " \
                            f"{', '.join(BACKUP_INTERVALS.keys())}. Aborting...")
-            exit(1)
+            logging.error(err_string)
+            raise Exception(err_string)
         backup_schedule[backup_interval] = int(site_data['backup_intervals'][backup_interval])
         assert(backup_schedule[backup_interval] >= 0)
     return backup_schedule
@@ -556,8 +561,9 @@ def retrieve_html_files(site_name, site_data, existing_backups):
             try:
                 exec_output = subprocess.check_output(copy_string, stderr=subprocess.STDOUT, shell=True)
             except subprocess.CalledProcessError as e:
-                logging.error('cp exited with error status ' + str(e.returncode) + ' and error: ' + e.output)
-                exit(1)
+                err_string = 'cp exited with error status ' + str(e.returncode) + ' and error: ' + e.output
+                logging.error(err_string)
+                raise Exception(err_string)
             first_rsync = False
     log_string = f'Starting HTML file retrieval using rsync for site {site_name} to {html_files_dir}'
     if first_rsync:
@@ -571,8 +577,9 @@ def retrieve_html_files(site_name, site_data, existing_backups):
     try:
         exec_output = subprocess.check_output(rsync_string, stderr=subprocess.STDOUT, shell=True)
     except subprocess.CalledProcessError as e:
-        logging.error('rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output))
-        exit(1)
+        rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
+        logging.error(rsync_err_string)
+	raise Exception(rsync_err_string)
     logging.info(f'Completed HTML file using rsync retrieval for site {site_name} to {html_files_dir}')
 
 
@@ -602,8 +609,9 @@ def dump_db(site_name, site_data):
     try:
         exec_output = subprocess.check_output(rsync_string, stderr=subprocess.STDOUT, shell=True)
     except subprocess.CalledProcessError as e:
-        logging.error('rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output))
-        exit(1)
+        rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
+        logging.error(rsync_err_string)
+	raise Exception(rsync_err_string)
     logging.debug(f'DB dump retrieved. Now delete on server.')
     rm_string = f"rm /home/{site_data['ssh_username']}/tmp/database.sql"
     logging.debug(f"Executing this command over SSH: '{rm_string}'")
