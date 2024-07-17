@@ -71,6 +71,7 @@ class g:
     gmail_password = None
     notification_target_email = None
     did_a_backup = None
+    ssh_test_failure = None
 
 
 @app.command()
@@ -98,6 +99,14 @@ def process(
             "prompted for the password on command line.")] = False,
         no_email: Annotated[bool, typer.Option("--no-email", help="If specified, then notification emails are " \
             "not sent.")] = False,
+        backup_now: Annotated[bool, typer.Option("--backup-now", help="If specified, then a target backups_dir " \
+            "outside of default ./backups must also be specified.  Some (e.g. --backup-site site1 --backup-site " \
+            "site2) or all (default) websites listed in vault.yml are backed up to the --backups_dir target " \
+            "directory now independent of specified backup intervals in vault.yml.  In fact, websites without "
+            "a backup schedule can only be backed up using this --backup-now flag.")] = False,
+        test_ssh: Annotated[bool, typer.Option("--ssh-test", help="Cycle through all sites in vault.yml and test " \
+            "SSH connectivity to each site.  Specifying subset of sites to test using --backup-site " \
+            "parameters is fine.")] = False,
         logging_level: Annotated[
             LoggingLevel, typer.Option(case_sensitive=False)
             ] = LoggingLevel.warning.value):
@@ -112,7 +121,7 @@ def process(
 
     # Grab directoy path to backups
     if backups_dir:
-        g.backups_dir_path = backups_dir
+        g.backups_dir_path = str(backups_dir)
     else:
         g.backups_dir_path = os.path.dirname(os.path.abspath(__file__)) + '/backups'
 
@@ -120,17 +129,6 @@ def process(
     root_logger = logging.getLogger() # Grab root logger
     root_logger.setLevel(logging.NOTSET) # Ensure EVERYTHING is logged thru root logger (don't block anything there)
     logging_formatter = logging.Formatter('%(asctime)s %(levelname)s\t%(message)s', '%Y-%m-%d %H:%M:%S')
-
-    # Log into central messages files in the backups directory
-    if not os.path.isdir(g.backups_dir_path):
-        os.mkdir(g.backups_dir_path)
-    if not os.path.isfile(g.backups_dir_path + '/messages.log'):
-        Path(g.backups_dir_path + '/messages.log').touch()
-    file_handler = logging.handlers.RotatingFileHandler(g.backups_dir_path + '/messages.log', maxBytes=10000000, \
-        backupCount=1)
-    file_handler.setLevel(logging.DEBUG) # Into log files, write everything including DEBUG messages
-    file_handler.setFormatter(logging_formatter)
-    root_logger.addHandler(file_handler)
 
     # Echo messages to console (stdout)
     console_handler = logging.StreamHandler()
@@ -149,6 +147,32 @@ def process(
 
     # Create a hook to funnel all unhandled exceptions into errors
     sys.excepthook = except_hook
+
+    # Before we start logging into backups directory, make sure its legit backups directory
+    if backup_now:
+        if not backups_dir:
+            err_string = 'When --backup-now is specified, --backups-dir must also be provided to specify a ' \
+                'location outside of normal backups directory for backup files.'
+            logging.error(err_string)
+            raise Exception(err_string)
+        normal_backups_dir = Path(os.path.dirname(os.path.abspath(__file__)) + '/backups')
+        specified_backups_dir = Path(backups_dir)
+        if normal_backups_dir in specified_backups_dir.parents:
+            err_string = 'When --backup-now is specified, provided --backups-dir cannot be within normal backups ' \
+                f'location.  However {str(specified_backups_dir)} exists within {str(normal_backups_dir)} directory.'
+            logging.error(err_string)
+            raise Exception(err_string)
+
+    # Log into central messages files in the backups directory
+    if not os.path.isdir(g.backups_dir_path):
+        os.mkdir(g.backups_dir_path)
+    if not os.path.isfile(g.backups_dir_path + '/messages.log'):
+        Path(g.backups_dir_path + '/messages.log').touch()
+    file_handler = logging.handlers.RotatingFileHandler(g.backups_dir_path + '/messages.log', maxBytes=10000000, \
+        backupCount=1)
+    file_handler.setLevel(logging.DEBUG) # Into log files, write everything including DEBUG messages
+    file_handler.setFormatter(logging_formatter)
+    root_logger.addHandler(file_handler)
 
     # Open vault file with credentials and settings
     program_path = os.path.dirname(os.path.abspath(__file__))
@@ -205,18 +229,42 @@ def process(
     # Confirm required credentials provided for each site needed for backup access
     for site_name in sites_data:
         sites_data[site_name]['do_mysql_backup'] = confirm_keys(vault_file, sites_data, site_name, \
-            ['ssh_hostname', 'ssh_username', 'ssh_port', 'mysql_user', 'mysql_password', 'mysql_db', \
-             'backup_intervals'])
+            ['ssh_hostname', 'ssh_username', 'ssh_port', 'mysql_user', 'mysql_password', 'mysql_db'])
 
-    # Now, do the backups (if enough time has transpired that a new backup is required per site backup schedules)
-    g.did_a_backup = False
-    for site_name in sites_data:
-        site_data = sites_data[site_name]
-        backup_schedule = get_backup_schedule(site_data)
-        do_backup_if_time(site_name, site_data, backup_schedule)
-
-    if not g.did_a_backup:
+    # Do simple SSH establishment to all sites if user specifies --test-ssh
+    if test_ssh:
+        # Force logging level up to at least INFO level to see results of an SSH test
+        if logging_level_numeric > getattr(logging, 'INFO'):
+            console_handler.setLevel(getattr(logging, 'INFO'))
+            # Tamp down Paramiko INFO level logging if we're at INFO level globally, else it's too chatty
+            # with logging INFO
+            logging.getLogger("paramiko").setLevel(logging.WARNING)
+        g.ssh_test_failure = False
+        for site_name in sites_data:
+            site_data = sites_data[site_name]
+            ssh_test(site_name, site_data)
+        if g.ssh_test_failure and logging_level_numeric >= getattr(logging, 'INFO'):
+            print('SSH failure occurred.  Suggestion:  re-run with --logging-level DEBUG to debug failed ' \
+                'SSH connection(s)')
         exit(0)
+
+    # Allow for a triggered --backup-now which backs up all sites independent of backup schedule
+    elif backup_now:
+        for site_name in sites_data:
+            site_data = sites_data[site_name]
+            do_backup(site_name, site_data)
+
+    # It not a "now" (--backup-now) backup, then do the backups if enough time has transpired that a new backup
+    # is required per site backup schedules
+    else:
+        g.did_a_backup = False
+        for site_name in sites_data:
+            site_data = sites_data[site_name]
+            backup_schedule = get_backup_schedule(site_data)
+            do_backup_if_time(site_name, site_data, backup_schedule)
+
+        if not g.did_a_backup:
+            exit(0)
 
     du_string = '/usr/bin/du -d 2 -h ' + g.backups_dir_path
     logging.debug(f'Executing: {du_string}')
@@ -242,12 +290,13 @@ class EmailFilter(logging.Filter):
 
 
 def get_backup_schedule(site_data):
-    global g
+    if not 'backup_intervals' in site_data:
+        return None
     backup_schedule = {}
     for backup_interval in site_data['backup_intervals']:
         if backup_interval not in BACKUP_INTERVALS.keys():
             err_string = f"Specified backup interval, '{backup_interval}', must be one of: " \
-                           f"{', '.join(BACKUP_INTERVALS.keys())}. Aborting...")
+                f"{', '.join(BACKUP_INTERVALS.keys())}. Aborting..."
             logging.error(err_string)
             raise Exception(err_string)
         backup_schedule[backup_interval] = int(site_data['backup_intervals'][backup_interval])
@@ -465,7 +514,21 @@ def get_current_backups_tracker(site_name):
     return current_backups_tracker
     
 
-def do_backup(site_name, site_data, existing_backups):
+def ssh_test(site_name, site_data):
+    logging.info(f'Testing SSH connection to site {site_name}')
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    try:
+        client.connect(site_data['ssh_hostname'], username=site_data['ssh_username'], port=int(site_data['ssh_port']))
+        msg = [stdin, stdout, stderr] = client.exec_command('ls')
+    except:
+        logging.info(f'SSH test *** FAILED *** for site {site_name}!')
+        g.ssh_test_failure = True
+        return
+    logging.info(f'SSH test succeeded for site {site_name}!')
+
+
+def do_backup(site_name, site_data, existing_backups=None):
     global g
 
     # Make sure backup directories exist to backup into
@@ -551,7 +614,7 @@ def retrieve_html_files(site_name, site_data, existing_backups):
     # Seed the target /files directory with files from the last backup to drastically reduce rsync
     # retrieval data and time
     first_rsync = True
-    if len(existing_backups) > 1:
+    if existing_backups is not None and len(existing_backups) > 1:
         last_backup = existing_backups[-1][1]
         if not is_zip_file(last_backup):
             last_backup_path = g.backups_dir_path + '/' + site_name + '/' + last_backup + '/files'
@@ -578,7 +641,7 @@ def retrieve_html_files(site_name, site_data, existing_backups):
     except subprocess.CalledProcessError as e:
         rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
         logging.error(rsync_err_string)
-	raise Exception(rsync_err_string)
+        raise Exception(rsync_err_string)
     logging.info(f'Completed HTML file using rsync retrieval for site {site_name} to {html_files_dir}')
 
 
@@ -606,7 +669,7 @@ def dump_db(site_name, site_data):
     except subprocess.CalledProcessError as e:
         rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
         logging.error(rsync_err_string)
-	raise Exception(rsync_err_string)
+        raise Exception(rsync_err_string)
     logging.debug(f'DB dump retrieved. Now delete on server.')
     rm_string = f"rm /home/{site_data['ssh_username']}/tmp/database.sql"
     logging.debug(f"Executing this command over SSH: '{rm_string}'")

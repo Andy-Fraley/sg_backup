@@ -11,6 +11,7 @@ vault.yml
 tmp/
 bak/
 backups/
+ondemand_backups/
 
 #######################################################################################################################
 # Generic Python .gitignore's below
