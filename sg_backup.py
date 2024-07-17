@@ -368,6 +368,11 @@ def get_current_tracker_and_backups(site_name):
 
 
 def do_backup_if_time(site_name, site_data, backup_schedule):
+    # Never do backups for websites with no backup schedule in vault.yml
+    if backup_schedule is None:
+        logging.info(f'Site {site_name} does not have backup schedule.  Skipping timed backup for this site')
+        return
+    
     # Get current backup tracker info from JSON file and scan existing backups on disk *and* ensure they
     # are in sync (else Exception is thrown)
     (backups_tracker_current, existing_backups) = get_current_tracker_and_backups(site_name)
