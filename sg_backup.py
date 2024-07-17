@@ -569,8 +569,7 @@ def retrieve_html_files(site_name, site_data, existing_backups):
     if first_rsync:
         log_string += ' (can take a while since this is first rsync retrieval)'
     logging.info(log_string)
-    rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
-        ' -i ' + str(Path.home()) + '/.ssh/' + str(site_data['ssh_key_file']) + '" "' + \
+    rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
         str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + \
         '/www/' + site_data['site_hostname'] + '/public_html/*" "' + html_files_dir + '"'
     logging.debug(f'Executing: {rsync_string}')
@@ -587,12 +586,9 @@ def dump_db(site_name, site_data):
     global g
 
     logging.info(f'Starting database dump for site {site_name}')
-    mykey = paramiko.RSAKey.from_private_key_file(str(Path.home()) + '/.ssh/' + str(site_data['ssh_key_file']),
-        str(site_data['ssh_key_passphrase']))
     client = paramiko.SSHClient()
     client.load_system_host_keys()
-    client.connect(site_data['ssh_hostname'], username=site_data['ssh_username'], pkey=mykey,
-                   port=int(site_data['ssh_port']))
+    client.connect(site_data['ssh_hostname'], username=site_data['ssh_username'], port=int(site_data['ssh_port']))
     mysqldump_string = f"mysqldump -u {site_data['mysql_user']} -p{site_data['mysql_password']} " \
         f"{site_data['mysql_db']} >/home/{site_data['ssh_username']}/tmp/database.sql"
     mysqldump_string_star = f"mysqldump -u {site_data['mysql_user']} -p***** " \
@@ -601,8 +597,7 @@ def dump_db(site_name, site_data):
     msg = [stdin, stdout, stderr] = client.exec_command(mysqldump_string)
     logging.debug(f'DB dump now under /tmp on server. Will do rsync to retrieve it')
     db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/db/database.sql'
-    rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
-        ' -i ' + str(Path.home()) + '/.ssh/' + str(site_data['ssh_key_file']) + '" "' + \
+    rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
         str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + \
         '/tmp/database.sql' + '" "' + db_dump_filename + '"'
     logging.debug(f'Executing: {rsync_string}')
