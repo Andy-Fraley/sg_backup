@@ -392,15 +392,19 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
 
     else:
         for backup_interval in backup_schedule.keys():
-            # Figure if we have to do backup for any of the backup intervals
-            most_recent_backup_stamp = backups_tracker_current[backup_interval][-1]
-            most_recent_backup_datetime = datetime.datetime.strptime(strip_zip(most_recent_backup_stamp),
-                                                                     TIMESTAMP_FORMAT)
-            logging.debug(f'Most recent for {backup_interval} interval was {most_recent_backup_stamp}')
-            logging.debug(f'Time diff in secs for {backup_interval} is '\
-                           f'{g.datetime_start - most_recent_backup_datetime}')
-            if g.datetime_start - most_recent_backup_datetime > BACKUP_INTERVALS[backup_interval]:
-                logging.info(f'Doing new backup for site {site_name} on {backup_interval} schedule')
+            if backup_interval in backups_tracker_current:
+                # Figure if we have to do backup for any of the backup intervals
+                most_recent_backup_stamp = backups_tracker_current[backup_interval][-1]
+                most_recent_backup_datetime = datetime.datetime.strptime(strip_zip(most_recent_backup_stamp),
+                    TIMESTAMP_FORMAT)
+                logging.debug(f'Most recent for {backup_interval} interval was {most_recent_backup_stamp}')
+                logging.debug(f'Time diff in secs for {backup_interval} is '\
+                    f'{g.datetime_start - most_recent_backup_datetime}')
+                if g.datetime_start - most_recent_backup_datetime > BACKUP_INTERVALS[backup_interval]:
+                    logging.info(f'Doing new backup for site {site_name} on {backup_interval} schedule')
+                    backups_tracker_new[backup_interval] = [g.datetime_start_string]
+                    do_new_backup = True
+            else:
                 backups_tracker_new[backup_interval] = [g.datetime_start_string]
                 do_new_backup = True
 
