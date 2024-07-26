@@ -91,7 +91,7 @@ def process(
         use_keyring: Annotated[bool, typer.Option("--use-keyring", help="Using machine keyring to store the vault " \
             "credentials file password is useful for running this utility using cron without leaking the " \
             "credentials file password by storing it in a script or in a file. If this option is specified, then " \
-            "the keyring value backup_siteground:vault_password is used as a password for the credentials vault " \
+            "the keyring value sg_backup:vault_password is used as a password for the credentials vault " \
             "file (defaults to vault.yml). In addition, two simple utilities are are provided to set and clear " \
             "the vault password in the keyring on this machine. Use specify_vault_password.py to " \
             "store vault.yml password in keyring on this machine. And use clear_vault_password.py to clear " \
@@ -182,7 +182,7 @@ def process(
         vault_file_path = program_path + '/vault.yml'
 
     if use_keyring:
-        vault_password = keyring.get_password('backup_siteground', 'default')
+        vault_password = keyring.get_password('sg_backup', 'default')
         if not vault_password:
             err_string = 'Use ./specify_vault_password.py to set password if you intend to use keyring'
             logging.error(err_string)
@@ -705,7 +705,7 @@ def except_hook(type,value,traceback):
     # And because flow was interrupted, handled ERROR log entries will not be emailed to admin, so email
     # the thrown unhandled exception right here
     error_string = g.string_stream.getvalue()
-    send_admin_email(f'backup_siteground encountered errors:\n{error_string}')
+    send_admin_email(f'sg_backup encountered errors:\n{error_string}')
 
 
 def send_email(recipient, subject, body):
@@ -732,9 +732,9 @@ def send_email(recipient, subject, body):
 
 def send_admin_email(body):
     if 'ERROR' in body:
-        subject = 'backup_siteground.py encountered errors'
+        subject = 'sg_backup.py encountered errors'
     else:
-        subject = 'backup_siteground.py completed without errors'
+        subject = 'sg_backup.py completed without errors'
     send_email(g.notification_target_email, subject, body)
 
 
