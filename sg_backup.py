@@ -21,10 +21,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import getpass
-import keyring
 import sys
 import io
 import smtplib
+import errno
 
 
 app = typer.Typer()
@@ -80,14 +80,12 @@ def process(
             "is to backup all sites listed in the vault credentials file. But by specifying one more more sites " \
             "with this option, you can backup just the specified subset of sites.  To backup site1_org and " \
             "site2_com, you would specify --backup-site site1_org --backup-site site2_com")] = None,
-        backups_dir: Annotated[Optional[Path], typer.Option("--backups-dir", exists=True, dir_okay=True,
-            file_okay=False, writable=True, resolve_path=True, help="Target directory for backups. If not " \
+        backups_dir: Annotated[str, typer.Option("--backups-dir", help="Target directory for backups. If not " \
             "specified, defaults to ./backups directory in the same folder as this backups_siteground.py " \
             "utility.")] = None,
-        vault_file: Annotated[Optional[Path], typer.Option("--vault-file", exists=True, file_okay=True, dir_okay=False,
-            readable=True, resolve_path=True, help="Credentials and settings vault file which is an encrypted " \
-            "ansible vault file. If not specified, defaults to ./vault.yml file in the same directory as this " \
-            "backups_siteground.py utility.")] = None,
+        vault_file: Annotated[str, typer.Option("--vault-file", help="Credentials and settings vault file which is " \
+            "an encrypted ansible vault file. If not specified, defaults to ./vault.yml file in the same directory " \
+            "as this backups_siteground.py utility.")] = None,
         use_keyring: Annotated[bool, typer.Option("--use-keyring", help="Using machine keyring to store the vault " \
             "credentials file password is useful for running this utility using cron without leaking the " \
             "credentials file password by storing it in a script or in a file. If this option is specified, then " \
@@ -121,7 +119,7 @@ def process(
 
     # Grab directoy path to backups
     if backups_dir:
-        g.backups_dir_path = str(backups_dir)
+        g.backups_dir_path = os.path.abspath(backups_dir)
     else:
         g.backups_dir_path = os.path.dirname(os.path.abspath(__file__)) + '/backups'
 
@@ -148,32 +146,6 @@ def process(
     # Create a hook to funnel all unhandled exceptions into errors
     sys.excepthook = except_hook
 
-    # Before we start logging into backups directory, make sure its legit backups directory
-    if backup_now:
-        if not backups_dir:
-            err_string = 'When --backup-now is specified, --backups-dir must also be provided to specify a ' \
-                'location outside of normal backups directory for backup files.'
-            logging.error(err_string)
-            raise Exception(err_string)
-        normal_backups_dir = Path(os.path.dirname(os.path.abspath(__file__)) + '/backups')
-        specified_backups_dir = Path(backups_dir)
-        if normal_backups_dir in specified_backups_dir.parents:
-            err_string = 'When --backup-now is specified, provided --backups-dir cannot be within normal backups ' \
-                f'location.  However {str(specified_backups_dir)} exists within {str(normal_backups_dir)} directory.'
-            logging.error(err_string)
-            raise Exception(err_string)
-
-    # Log into central messages files in the backups directory
-    if not os.path.isdir(g.backups_dir_path):
-        os.mkdir(g.backups_dir_path)
-    if not os.path.isfile(g.backups_dir_path + '/messages.log'):
-        Path(g.backups_dir_path + '/messages.log').touch()
-    file_handler = logging.handlers.RotatingFileHandler(g.backups_dir_path + '/messages.log', maxBytes=10000000, \
-        backupCount=1)
-    file_handler.setLevel(logging.DEBUG) # Into log files, write everything including DEBUG messages
-    file_handler.setFormatter(logging_formatter)
-    root_logger.addHandler(file_handler)
-
     # Open vault file with credentials and settings
     program_path = os.path.dirname(os.path.abspath(__file__))
     if vault_file:
@@ -181,17 +153,16 @@ def process(
     else:
         vault_file_path = program_path + '/vault.yml'
 
-    if use_keyring:
-        vault_password = keyring.get_password('sg_backup', 'default')
-        if not vault_password:
-            err_string = 'Use ./specify_vault_password.py to set password if you intend to use keyring'
-            logging.error(err_string)
-            raise Exception(err_string)
-    elif os.path.isfile(program_path + '/.y4zwCKnyBvoPevYX'):
+    # Use 'hidden' file for vault password if exists, else prompt user for vault file password
+    if os.path.isfile(program_path + '/.y4zwCKnyBvoPevYX'):
         with open(program_path + '/.y4zwCKnyBvoPevYX', 'r') as f:
             vault_password = f.readline().strip()
     else:
         vault_password = getpass.getpass('Password for vault.yml: ')
+
+    # Ensure vault file exists
+    if not os.path.isfile(vault_file_path):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), vault_file_path)
 
     vault = Vault(vault_password)
     vault_data = vault.load(open(vault_file_path).read())
@@ -210,6 +181,32 @@ def process(
         g.gmail_user = vault_data_gmail['user']
         g.gmail_password = vault_data_gmail['password']
         g.notification_target_email = vault_data_gmail['notify_target']
+
+    # Before we start logging into backups directory, make sure its legit backups directory
+    if backup_now:
+        if not backups_dir:
+            err_string = 'When --backup-now is specified, --backups-dir must also be provided to specify a ' \
+                'location outside of normal backups directory for backup files.'
+            logging.error(err_string)
+            raise Exception(err_string)
+        normal_backups_dir = Path(os.path.dirname(os.path.abspath(__file__)) + '/backups')
+        specified_backups_dir = Path(backups_dir)
+        if normal_backups_dir in specified_backups_dir.parents:
+            err_string = 'When --backup-now is specified, provided --backups-dir cannot be within normal backups ' \
+                f'location.  However {str(specified_backups_dir)} exists within {str(normal_backups_dir)} directory.'
+            logging.error(err_string)
+            raise Exception(err_string)
+
+    # Log to central messages files in the backups directory
+    if not os.path.isdir(g.backups_dir_path):
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), g.backups_dir_path)
+    if not os.path.isfile(g.backups_dir_path + '/messages.log'):
+        Path(g.backups_dir_path + '/messages.log').touch()
+    file_handler = logging.handlers.RotatingFileHandler(g.backups_dir_path + '/messages.log', maxBytes=10000000, \
+        backupCount=1)
+    file_handler.setLevel(logging.DEBUG) # Into log files, write everything including DEBUG messages
+    file_handler.setFormatter(logging_formatter)
+    root_logger.addHandler(file_handler)
 
     # If user specified specific list of sites to backup, using --backup-site site1_com --backup-site site2_org, etc.,
     # then reduce sites being backed up to that subset of sites
