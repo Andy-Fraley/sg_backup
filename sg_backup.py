@@ -25,12 +25,25 @@ import sys
 import io
 import smtplib
 import errno
+import zipfile
 
 
 app = typer.Typer()
 
 
 TIMESTAMP_FORMAT = '%Y%m%d%H%M%S'
+
+# Suffix appended to a backup directory name (e.g. '20260913023011.partial') while it is still being built
+# by do_backup(), and to a zip file name (e.g. '20260913023011.zip.partial') while it is still being written
+# by compress_backup(). Anything ending in this suffix is, by definition, an incomplete artifact from a run
+# that was interrupted (crash, power loss, kill) -- never a backup that "counts". Startup reconciliation
+# (see get_current_tracker_and_backups()) deletes anything found with this suffix.
+PARTIAL_SUFFIX = '.partial'
+
+# Name of the per-site subdirectory that reconciliation moves orphaned, unrecognized backups into (backups
+# found on disk with no corresponding backups_tracker.json entry) instead of deleting them outright, so a
+# human can inspect and decide what to do with them.
+QUARANTINE_DIRNAME = 'quarantine'
 
 # Intervals are slightly less than stated backup interval to allow for jitter of cron kickoff timing.
 # These are 'Live' backup intervals below.  Comment these out and use artificially short test intervals below
@@ -72,6 +85,13 @@ class g:
     notification_target_email = None
     did_a_backup = None
     ssh_test_failure = None
+    # Accumulates human-readable warnings raised during startup reconciliation (leftover .partial artifacts
+    # removed, orphaned backups quarantined, stale tracker entries dropped) so they can be folded into the
+    # run's notification email even when the run is otherwise clean. Reset to [] at the top of process();
+    # left as None here (rather than []) so a stray direct call into reconciliation logic without going
+    # through process() first (e.g. a test harness) can detect and initialize it lazily instead of silently
+    # sharing one mutable list across unrelated runs.
+    reconciliation_warnings = None
 
 
 @app.command()
@@ -116,6 +136,7 @@ def process(
     locale.setlocale(locale.LC_ALL, '')
     g.datetime_start = datetime.datetime.now()
     g.datetime_start_string = g.datetime_start.strftime(TIMESTAMP_FORMAT)
+    g.reconciliation_warnings = []  # Fresh per run; populated by get_current_tracker_and_backups() below
 
     # Grab directoy path to backups
     if backups_dir:
@@ -260,7 +281,13 @@ def process(
             backup_schedule = get_backup_schedule(site_data)
             do_backup_if_time(site_name, site_data, backup_schedule)
 
-        if not g.did_a_backup:
+        # Historically this exited immediately (skipping the notification email entirely) whenever no site
+        # needed a new backup this run. That's still fine when nothing else happened -- but if startup
+        # reconciliation found and cleaned up a problem (leftover .partial artifact, orphaned backup
+        # quarantined, stale tracker entry dropped) during those do_backup_if_time() calls, that warning
+        # needs to reach the admin even though no new backup was taken. So only take the early exit when
+        # there's nothing -- backup or warning -- worth emailing about.
+        if not g.did_a_backup and not g.reconciliation_warnings:
             exit(0)
 
     du_string = '/usr/bin/du -d 2 -h ' + g.backups_dir_path
@@ -273,6 +300,17 @@ def process(
         logging.error('du exited with error status ' + str(e.returncode) + ' and error: ' + e.output)
 
     error_string = g.string_stream.getvalue()
+
+    # Fold in any startup reconciliation warnings. The run's notification email (below) is already sent
+    # unconditionally on every normal run (success, "no backups to do", or error alike -- see
+    # send_admin_email()/EmailFilter), so riding along on that existing single email is simpler and less
+    # noisy than sending a second, separate "warnings" email for the same run.
+    if g.reconciliation_warnings:
+        warnings_block = '\n'.join(g.reconciliation_warnings)
+        error_string += '\n\nBackup reconciliation warnings (inspect the quarantine/ subfolder(s) under ' \
+            f'the backups directory; delete quarantined items once you are satisfied they are not needed):' \
+            f'\n{warnings_block}'
+
     if error_string:
         send_admin_email(error_string)
 
@@ -302,6 +340,19 @@ def get_backup_schedule(site_data):
 
 
 def get_existing_backups(site_name):
+    """
+    Scan <backups_dir>/<site_name>/ on disk and return the list of *complete* backups found there (either a
+    timestamp-named directory or a timestamp-named .zip file), as (datetime, name) tuples sorted oldest to
+    newest -- the same contract this function has always had.
+
+    Two kinds of on-disk entries are deliberately excluded, neither of which is a finished backup:
+      - the 'quarantine' subdirectory itself (see get_current_tracker_and_backups()), which holds backups
+        reconciliation could not match to the tracker.
+      - anything with a name ending in '.partial' (a backup directory still being built by do_backup(), or a
+        zip still being written by compress_backup()). This check has to happen *before* the timestamp
+        parse below because pathlib's .stem only strips the outermost extension, so '<stamp>.partial'
+        would otherwise parse as a perfectly valid '<stamp>' backup and be mistaken for a complete one.
+    """
     global g
 
     backup_path = g.backups_dir_path + '/' + site_name
@@ -312,6 +363,10 @@ def get_existing_backups(site_name):
     for subfolder in [ f.path for f in os.scandir(backup_path) if f.is_dir() or ( f.is_file() and \
         is_zip_file(f.path) ) ]:
         subfolder_leaf = os.path.basename(subfolder)
+
+        if subfolder_leaf == QUARANTINE_DIRNAME or is_partial_name(subfolder_leaf):
+            continue
+
         subfolder_leaf_wo_ext = pathlib.Path(subfolder_leaf).stem
         try:
             backup_datetime = datetime.datetime.strptime(subfolder_leaf_wo_ext, TIMESTAMP_FORMAT)
@@ -327,41 +382,158 @@ def is_zip_file(file_name):
     return os.path.splitext(file_name)[1] == '.zip'
 
 
+def is_partial_name(name):
+    """
+    True if `name` is an in-progress artifact rather than a finished backup: either '<stamp>.partial' (a
+    backup directory do_backup() is still building) or '<stamp>.zip.partial' (a zip compress_backup() is
+    still writing). Both simply end in '.partial', so one check covers both cases.
+    """
+    return name.endswith(PARTIAL_SUFFIX)
+
+
 def get_current_tracker_and_backups(site_name):
+    """
+    Load backups_tracker.json for `site_name`, reconcile it against what is actually on disk, and return the
+    resulting consistent (backups_tracker, existing_backups) pair.
+
+    This used to raise an Exception the instant the tracker and disk disagreed, which required a human to
+    manually inspect and delete files before the script could run again -- e.g. after a crash mid-backup
+    left an orphan directory the tracker didn't know about, every subsequent run aborted with 'do not have
+    corresponding entry in backups_tracker.json file' until someone intervened. Since a backup only "counts"
+    once do_backup() has renamed it off its '.partial' working name (see do_backup()) and the tracker is
+    only ever rewritten atomically (see write_backups_tracker()), any mismatch this function now finds is
+    necessarily leftover mess from an interrupted run, not data corruption -- so it can safely clean up and
+    continue rather than aborting. Reconciliation, in order:
+
+      1. Delete any '.partial' / '.zip.partial' item found under the site directory -- an in-progress
+         backup or compression that was interrupted and can't be completed after the fact.
+      2. Move any backup found on disk that the tracker does not reference into <site>/quarantine/ (never
+         delete -- a human should look at it) so it stops confusing future comparisons.
+      3. Drop any tracker entry that has nothing on disk (e.g. it just got quarantined out from under it)
+         from every interval list, and rewrite the tracker atomically.
+
+    Every action taken here is logged as a warning and also appended to g.reconciliation_warnings so it can
+    be surfaced in the run's notification email (see process()) even when the run otherwise completes
+    cleanly.
+    """
     global g
+
+    # A harness or other caller that reaches this function without going through process() first (which
+    # resets this list every run) still gets a working list rather than an AttributeError/TypeError.
+    if g.reconciliation_warnings is None:
+        g.reconciliation_warnings = []
+
+    site_dir = g.backups_dir_path + '/' + site_name
+
+    # --- Step 1: purge leftover '.partial' / '.zip.partial' artifacts from an interrupted backup or
+    # compression. These can never be completed after the fact; the only safe move is to discard them. ---
+    if os.path.isdir(site_dir):
+        for entry in os.scandir(site_dir):
+            if not is_partial_name(entry.name):
+                continue
+            warning = f"Site '{site_name}': removing leftover in-progress artifact '{entry.name}' " \
+                '(it belongs to a backup or compression that was interrupted before it finished).'
+            logging.warning(warning)
+            g.reconciliation_warnings.append(warning)
+            try:
+                if entry.is_dir():
+                    shutil.rmtree(entry.path)
+                else:
+                    os.remove(entry.path)
+            except OSError as e:
+                # Don't let a cleanup failure (e.g. a permissions problem) take down the whole run -- log it
+                # and move on. It will simply be found and retried again on the next run.
+                cleanup_warning = f"Site '{site_name}': could not remove leftover '{entry.path}': {e}"
+                logging.warning(cleanup_warning)
+                g.reconciliation_warnings.append(cleanup_warning)
 
     existing_backups = get_existing_backups(site_name)
     backups_tracker_current = get_current_backups_tracker(site_name)
-
-    # To ensure backup set and corresponding backups tracker JSON file are in sync, we need to compare set of
-    # existing_backups -> backups_tracker_current, checking for missing. And have to do vice versa,
-    # comparing backup_tracker_current -> existing_backups, checking for missing
     set_of_existing = sorted({ x[1] for x in existing_backups })
-    set_of_tracked = sorted({ x for list_values in backups_tracker_current.values() for x in list_values })
-    missing_from_tracked = []
-    missing_from_existing = []
-    if set_of_existing != set_of_tracked:
-        logging.debug(f'existing_backups: {existing_backups}')
-        logging.debug(f'set_of_exising: {set_of_existing}')
-        logging.debug(f'backups_tracker_current: {backups_tracker_current}')
-        logging.debug(f'set_of_tracked: {set_of_tracked}')
-        for existing_element in set_of_existing:
-            if existing_element not in set_of_tracked:
-                missing_from_tracked.append(existing_element)
-        missing_from_tracked.sort()
-        for tracked_element in set_of_tracked:
-            if tracked_element not in set_of_existing:
-                missing_from_existing.append(tracked_element)
-        missing_from_existing.sort()
-        error_string = ''
-        if len(missing_from_existing) > 0:
-            error_string = f"The following elements in {site_name} backups_tracker.json file do not have " \
-                f"corresponding backups: {', '.join(missing_from_existing)}. "
-        if len(missing_from_tracked) > 0:
-            error_string += f"The following elements in {site_name} set of backups do not have " \
-                f"corresponding entry in backups_tracker.json file: {', '.join(missing_from_tracked)}."
-        raise Exception(error_string)
+    # Compare by TIMESTAMP, not by exact name: the tracker names a backup '<stamp>' while it is the unzipped
+    # seed and '<stamp>.zip' once compress_backup() has run, and the tracker is only rewritten after the
+    # compression. A crash in between leaves disk saying '<stamp>.zip' and the tracker saying '<stamp>';
+    # that is the same complete backup, so it must be re-pointed (step 3), never quarantined.
+    on_disk_by_stamp = { strip_zip(name): name for name in set_of_existing }
+    tracked_stamps = { strip_zip(x) for list_values in backups_tracker_current.values() for x in list_values }
+
+    # --- Step 2: anything on disk the tracker doesn't know about gets quarantined, never deleted, so a
+    # human can decide what (if anything) to do with it. ---
+    missing_from_tracked = [ name for stamp, name in on_disk_by_stamp.items() if stamp not in tracked_stamps ]
+    if missing_from_tracked:
+        quarantine_dir = site_dir + '/' + QUARANTINE_DIRNAME
+        os.makedirs(quarantine_dir, exist_ok=True)
+        for orphan_name in sorted(missing_from_tracked):
+            orphan_path = site_dir + '/' + orphan_name
+            quarantine_path = quarantine_dir + '/' + orphan_name
+            # Don't clobber something already sitting in quarantine under the same name -- append a numeric
+            # suffix instead.
+            suffix = 1
+            while os.path.exists(quarantine_path):
+                quarantine_path = f'{quarantine_dir}/{orphan_name}.{suffix}'
+                suffix += 1
+            warning = f"Site '{site_name}': backup '{orphan_name}' exists on disk but is not referenced by " \
+                f"backups_tracker.json; moved to '{quarantine_path}' for inspection."
+            logging.warning(warning)
+            g.reconciliation_warnings.append(warning)
+            os.rename(orphan_path, quarantine_path)
+        # Disk changed (orphans moved out from under the site directory) -- re-scan before step 3 compares
+        # tracker entries against what's really there.
+        existing_backups = get_existing_backups(site_name)
+        set_of_existing = sorted({ x[1] for x in existing_backups })
+        on_disk_by_stamp = { strip_zip(name): name for name in set_of_existing }
+
+    # --- Step 3: anything the tracker references that no longer exists on disk gets dropped, across every
+    # interval list; an entry whose only difference from disk is the '.zip' suffix is re-pointed at the
+    # on-disk name; the tracker is then rewritten atomically. ---
+    tracker_changed = False
+    for backup_interval in list(backups_tracker_current.keys()):
+        kept = []
+        for backup_name in backups_tracker_current[backup_interval]:
+            stamp = strip_zip(backup_name)
+            if backup_name in set_of_existing:
+                kept.append(backup_name)
+            elif stamp in on_disk_by_stamp:
+                actual_name = on_disk_by_stamp[stamp]
+                warning = f"Site '{site_name}': backups_tracker.json names '{backup_name}' under " \
+                    f"'{backup_interval}' but the backup on disk is '{actual_name}' (compression finished " \
+                    'before the tracker was updated); tracker entry re-pointed at the on-disk name.'
+                logging.warning(warning)
+                g.reconciliation_warnings.append(warning)
+                kept.append(actual_name)
+                tracker_changed = True
+            else:
+                warning = f"Site '{site_name}': backups_tracker.json references '{backup_name}' under " \
+                    f"'{backup_interval}' but no such backup exists on disk; removed that tracker entry."
+                logging.warning(warning)
+                g.reconciliation_warnings.append(warning)
+                tracker_changed = True
+        backups_tracker_current[backup_interval] = kept
+    if tracker_changed:
+        write_backups_tracker(site_name, backups_tracker_current)
+
     return (backups_tracker_current, existing_backups)
+
+
+def write_backups_tracker(site_name, backups_tracker):
+    """
+    Atomically (re)write backups_tracker.json for `site_name`: serialize to a temp file in the same
+    directory, flush/fsync it, then os.replace() it over the real backups_tracker.json. os.replace is
+    atomic on the same filesystem, so a crash or power loss during the write can never leave a
+    truncated/corrupt backups_tracker.json behind -- readers always see either the old complete file or the
+    new complete file, never a half-written one. This replaces every previous bare
+    `json.dump(..., open(path, 'w'))` call against this file.
+    """
+    site_dir = g.backups_dir_path + '/' + site_name
+    final_path = site_dir + '/backups_tracker.json'
+    # A fixed (not tempfile-random) temp name so a leftover from a previously interrupted write is simply
+    # overwritten by the next attempt rather than accumulating stray files.
+    temp_path = site_dir + '/.backups_tracker.json.tmp'
+    with open(temp_path, 'w') as temp_file:
+        json.dump(backups_tracker, temp_file)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+    os.replace(temp_path, final_path)
 
 
 def do_backup_if_time(site_name, site_data, backup_schedule):
@@ -370,8 +542,9 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
         logging.info(f'Site {site_name} does not have backup schedule.  Skipping timed backup for this site')
         return
     
-    # Get current backup tracker info from JSON file and scan existing backups on disk *and* ensure they
-    # are in sync (else Exception is thrown)
+    # Get current backup tracker info from JSON file and scan existing backups on disk, reconciling any
+    # mismatch (leftover .partial artifacts removed, orphans quarantined, stale tracker entries dropped --
+    # see get_current_tracker_and_backups()) so what's returned is always consistent.
     (backups_tracker_current, existing_backups) = get_current_tracker_and_backups(site_name)
 
     backups_tracker_new = {}
@@ -412,12 +585,15 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
     else:
         logging.info(f'No backups to do for site {site_name}')
 
-    # Now update the JSON tracker file to associate the new backup set with backup interval(s)
+    # Now update the JSON tracker file to associate the new backup set with backup interval(s). This only
+    # runs once do_backup() (above) has returned, which only happens after it has renamed the new backup off
+    # its '.partial' working name -- so the tracker is never updated to reference a backup that didn't fully
+    # complete.
     backups_tracker_updated = merge_backups_trackers(site_name, backups_tracker_current, backups_tracker_new)
-    json.dump(backups_tracker_updated, open(g.backups_dir_path + '/' + site_name + '/backups_tracker.json', 'w'))
+    write_backups_tracker(site_name, backups_tracker_updated)
 
     # Now again after updating tracker, get current backup tracker info from JSON file and scan existing backups
-    # on disk *and* ensure they are in sync (else Exception is thrown)
+    # on disk, reconciling any mismatch (see get_current_tracker_and_backups())
     (backups_tracker_current, existing_backups) = get_current_tracker_and_backups(site_name)
 
     ###################################################################################################################
@@ -442,10 +618,10 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
     set_of_all_backups = { x for list_values in backups_tracker_current.values() for x in list_values }
     to_be_deleted = set_of_all_backups - set_of_backups_to_keep
     delete_backups(site_name, to_be_deleted)
-    json.dump(backups_tracker_new, open(g.backups_dir_path + '/' + site_name + '/backups_tracker.json', 'w'))
+    write_backups_tracker(site_name, backups_tracker_new)
 
     # Now again after updating tracker, get current backup tracker info from JSON file and scan existing backups
-    # on disk *and* ensure they are in sync (else Exception is thrown)
+    # on disk, reconciling any mismatch (see get_current_tracker_and_backups())
     (backups_tracker_current, existing_backups) = get_current_tracker_and_backups(site_name)
 
     ###################################################################################################################
@@ -468,10 +644,10 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
     backups_tracker_new = {}
     for backup_interval in set_based_backups_tracker:
         backups_tracker_new[backup_interval] = sorted(list(set_based_backups_tracker[backup_interval]))
-    json.dump(backups_tracker_new, open(g.backups_dir_path + '/' + site_name + '/backups_tracker.json', 'w'))
+    write_backups_tracker(site_name, backups_tracker_new)
 
     # One last time after all work done, get current backup tracker info from JSON file and scan existing backups
-    # on disk *and* ensure they are in sync (else Exception is thrown)
+    # on disk, reconciling any mismatch (see get_current_tracker_and_backups())
     (backups_tracker_current, existing_backups) = get_current_tracker_and_backups(site_name)
 
 
@@ -483,17 +659,50 @@ def strip_zip(file_name):
 
 
 def compress_backup(site_name, backup_directory_name):
+    """
+    Zip a complete backup directory into '<name>.zip' and remove the original directory.
+
+    Crash-safety: the archive is written directly to '<name>.zip.partial' (using zipfile, not
+    shutil.make_archive, since make_archive always names its own output '<base_name>.<format>' and can't be
+    pointed at an arbitrary '.zip.partial' filename) and only os.replace()'d onto the real '<name>.zip' once
+    writing is fully done; the original directory is only removed (shutil.rmtree) after that atomic replace
+    succeeds. So a crash mid-zip can never leave a truncated '<name>.zip' that looks like a valid, complete
+    compressed backup -- at worst it leaves an identifiable '<name>.zip.partial' file (which startup
+    reconciliation deletes, see get_current_tracker_and_backups()), and the original uncompressed directory
+    is still sitting there untouched, ready to be compressed again on the next run.
+    """
     global g
     backup_directory_path = g.backups_dir_path + '/' + site_name + '/' + backup_directory_name
     backup_directory_zip = backup_directory_path + '.zip'
+    backup_directory_zip_partial = backup_directory_zip + PARTIAL_SUFFIX  # '<name>.zip.partial'
     assert(os.path.isdir(backup_directory_path))
     assert(not(os.path.isfile(backup_directory_zip)))
     logging.info(f'Compressing backup {backup_directory_path} into {backup_directory_zip} ' \
                   '(can take a while for large sites)')
-    shutil.make_archive(backup_directory_path, 'zip', backup_directory_path)
+    _zip_directory(backup_directory_path, backup_directory_zip_partial)
+    os.replace(backup_directory_zip_partial, backup_directory_zip)
     shutil.rmtree(backup_directory_path)
     logging.info(f'Compressed backup {backup_directory_path} into {backup_directory_zip}')
     return
+
+
+def _zip_directory(source_dir, zip_path):
+    """
+    Write a zip archive of `source_dir` to the exact path `zip_path`, with archive member paths relative to
+    `source_dir` (matching the layout shutil.make_archive would have produced). Used by compress_backup() in
+    place of shutil.make_archive specifically so the output filename can be the '<name>.zip.partial' working
+    name required by that function's crash-safety design, rather than a name make_archive picks itself.
+    """
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for root, dirs, files in os.walk(source_dir):
+            # Record directory entries as well as files, exactly as shutil.make_archive did, so that empty
+            # directories (cache and upload folders are often empty) come back on a restore.
+            for dir_name in sorted(dirs):
+                dir_path = os.path.join(root, dir_name)
+                zip_file.write(dir_path, os.path.relpath(dir_path, source_dir))
+            for file_name in sorted(files):
+                file_path = os.path.join(root, file_name)
+                zip_file.write(file_path, os.path.relpath(file_path, source_dir))
 
 
 def delete_backups(site_name, to_be_deleted):
@@ -535,37 +744,62 @@ def ssh_test(site_name, site_data):
 
 
 def do_backup(site_name, site_data, existing_backups=None):
+    """
+    Perform one full backup (DB dump, if configured, plus rsync of site files) for a single site.
+
+    Crash-safety: the entire backup is built under a '<stamp>.partial' directory name (dump_db() and
+    retrieve_html_files() are both told to write into that name, not the final '<stamp>' name). Only after
+    both steps return successfully is that directory os.rename()'d to its real '<stamp>' name -- os.rename
+    is atomic on the same filesystem, so this is the single instant a backup "counts". A crash or power loss
+    at any point before that rename (including mid-rsync or mid-seed-copy, which can take a long time for
+    large sites) leaves, at worst, a '<stamp>.partial' directory -- never something bearing the final
+    timestamp name that looks complete but isn't. get_current_tracker_and_backups() deletes any such
+    leftover '.partial' directory it finds at the start of the next run, so an interrupted backup cleans
+    itself up automatically instead of requiring human intervention.
+    """
     global g
+
+    partial_name = g.datetime_start_string + PARTIAL_SUFFIX
+    site_dir = g.backups_dir_path + '/' + site_name
+    partial_dir = site_dir + '/' + partial_name
+    final_dir = site_dir + '/' + g.datetime_start_string
 
     # Make sure backup directories exist to backup into
     if not os.path.isdir(g.backups_dir_path):
         os.mkdir(g.backups_dir_path)
-    if not os.path.isdir(g.backups_dir_path + '/' + site_name):
-        os.mkdir(g.backups_dir_path + '/' + site_name)
-    if not os.path.isdir(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string):
-        os.mkdir(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string)
+    if not os.path.isdir(site_dir):
+        os.mkdir(site_dir)
+    if not os.path.isdir(partial_dir):
+        os.mkdir(partial_dir)
     if site_data['do_mysql_backup']:
-        if not os.path.isdir(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/db'):
-            os.mkdir(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/db')
-    if not os.path.isdir(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/files'):
-        os.mkdir(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/files')
+        if not os.path.isdir(partial_dir + '/db'):
+            os.mkdir(partial_dir + '/db')
+    if not os.path.isdir(partial_dir + '/files'):
+        os.mkdir(partial_dir + '/files')
 
-    # Hook up logging output stream into target backup directory
+    # Hook up logging output stream into target backup directory. This is opened against the '.partial'
+    # path; the open file descriptor stays valid across the later os.rename() of the parent directory (a
+    # rename doesn't invalidate already-open file handles, it just changes the path pointing at the same
+    # inode), so log messages keep landing in the right place before and after promotion.
     root_logger = logging.getLogger() # Grab root logger
     logging_formatter = logging.Formatter('%(asctime)s %(levelname)s\t%(message)s', '%Y-%m-%d %H:%M:%S')
-    file_handler = logging.FileHandler(g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + \
-        '/messages.log')
+    file_handler = logging.FileHandler(partial_dir + '/messages.log')
     file_handler.setLevel(logging.DEBUG) # Into log files, write everything including DEBUG messages
     file_handler.setFormatter(logging_formatter)
     root_logger.addHandler(file_handler)
-    
-    logging.info(f'Starting backup for {site_name}')
-    if site_data['do_mysql_backup']:
-        dump_db(site_name, site_data)
-    retrieve_html_files(site_name, site_data, existing_backups)
 
-    logging.info(f'Completed backup for {site_name} in ' \
-                  f"{g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string}")
+    logging.info(f'Starting backup for {site_name} (building at {partial_dir})')
+    if site_data['do_mysql_backup']:
+        dump_db(site_name, site_data, partial_name)
+    retrieve_html_files(site_name, site_data, existing_backups, partial_name)
+
+    # Everything succeeded -- promote the partial backup to its real, final name. Before this line, a crash
+    # leaves only a '.partial' directory that reconciliation will discard on the next run; after this line,
+    # the backup is complete and safe to record in backups_tracker.json (which do_backup_if_time() does
+    # immediately after this function returns).
+    os.rename(partial_dir, final_dir)
+
+    logging.info(f'Completed backup for {site_name} in {final_dir}')
 
     # Shutdown and remove per-backup logging handler
     file_handler.close()
@@ -614,8 +848,20 @@ def confirm_keys(vault_file, sites, site_name, full_key_list):
     return len(mysql_parameters) > 0
 
 
-def retrieve_html_files(site_name, site_data, existing_backups):
-    html_files_dir = g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/files'
+def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name):
+    """
+    Populate <site>/<backup_dir_name>/files via rsync from the SiteGround host.
+
+    `backup_dir_name` is the in-progress backup's directory name -- normally '<stamp>.partial' (see
+    do_backup()), so this always writes into the not-yet-promoted working directory, never directly into a
+    final-looking '<stamp>' name. To speed up rsync, 'files' is first seeded with a recursive copy of the
+    newest *existing, complete* backup's files (existing_backups only ever contains complete backups --
+    get_existing_backups() excludes '.partial' and quarantined entries), so rsync only has to transfer the
+    delta. Seeding into the partial path means a crash mid-copy (this can be a multi-GB copy for large
+    sites) or mid-rsync leaves only an incomplete '.partial' directory behind, never something that looks
+    like a finished backup.
+    """
+    html_files_dir = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name + '/files'
     assert(os.path.isdir(html_files_dir))
     # Seed the target /files directory with files from the last backup to drastically reduce rsync
     # retrieval data and time
@@ -651,7 +897,16 @@ def retrieve_html_files(site_name, site_data, existing_backups):
     logging.info(f'Completed HTML file using rsync retrieval for site {site_name} to {html_files_dir}')
 
 
-def dump_db(site_name, site_data):
+def dump_db(site_name, site_data, backup_dir_name):
+    """
+    Dump the WordPress MySQL database for `site_name` over SSH (mysqldump run remotely, output redirected to
+    a temp file on the remote host), then rsync that dump back into
+    <site>/<backup_dir_name>/db/database.sql and delete the remote copy.
+
+    `backup_dir_name` is the in-progress backup's directory name -- normally '<stamp>.partial' (see
+    do_backup()) -- so a crash here leaves the partial dump only under the not-yet-promoted '.partial'
+    directory, never under a final-looking '<stamp>' name.
+    """
     global g
 
     logging.info(f'Starting database dump for site {site_name}')
@@ -665,7 +920,7 @@ def dump_db(site_name, site_data):
     logging.debug(f"Executing this command over SSH: '{mysqldump_string_star}'")
     msg = [stdin, stdout, stderr] = client.exec_command(mysqldump_string)
     logging.debug(f'DB dump now under /tmp on server. Will do rsync to retrieve it')
-    db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/db/database.sql'
+    db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name + '/db/database.sql'
     rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
         str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + \
         '/tmp/database.sql' + '" "' + db_dump_filename + '"'
@@ -681,7 +936,6 @@ def dump_db(site_name, site_data):
     logging.debug(f"Executing this command over SSH: '{rm_string}'")
     msg = [stdin, stdout, stderr] = client.exec_command(rm_string)
     logging.debug(f'DB dump deleted on server.')
-    db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + g.datetime_start_string + '/db/database.sql'
     logging.info(f'Completed database dump for site {site_name} to {db_dump_filename}')
 
 

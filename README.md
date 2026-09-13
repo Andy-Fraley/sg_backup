@@ -106,16 +106,44 @@ emails.  And the notify_target parameter is the email address you want notificat
 account must have an app password configured (requires establishment of 2-factor authentication on the account you want
 to use for emails) and used as the password here.
 
-If you fail part-way through a backup, it may leave around fragments of a backup.  So if you see an error message
-like this:
+## Crash safety: partial backups, atomic tracker updates, and quarantine
 
-    Exception: The following elements in domain_com set of backups do not have corresponding entry in
-    backups_tracker.json file: 20240712230707.
+If a backup is interrupted part-way through (crash, power loss, kill), the script cleans up after itself
+automatically on its next run rather than requiring manual intervention. This is achieved with a few
+conventions worth understanding if you're ever poking around in the backups directory by hand:
 
-Then you'll need to remove the partial backup files before you can continue.  For the example above, it's as simple as
+- **`.partial` working names.** A new backup is built entirely under `<site>/<stamp>.partial/` (a directory)
+  -- the DB dump, the rsync of site files, and the unzipped "seed" copy from the previous backup are all
+  written there. Only once the DB dump and file rsync have both fully succeeded is that directory renamed
+  (atomically, via `os.rename`) to its real `<site>/<stamp>/` name. A backup only "counts" -- i.e. only
+  becomes eligible to be recorded in `backups_tracker.json` -- at that rename. Compression works the same
+  way: a backup being zipped is first written to `<stamp>.zip.partial` and only atomically replaced onto
+  `<stamp>.zip` once the archive is fully written.
 
-    rm -rf ./backups/domain_com/20240712230707
+  If the script is interrupted before a `.partial` item is promoted, it is left behind on disk. You do not
+  need to do anything about it: the next run finds and deletes any `.partial` directory or `.zip.partial`
+  file it sees before doing anything else, since neither can ever represent a complete, usable backup.
 
-Then fix whatever caused the backup to fail and rerun sg_backup.py.
+- **Atomic `backups_tracker.json` writes.** Every update to a site's `backups_tracker.json` is written to a
+  temp file in the same directory and then atomically swapped into place (`os.replace`), so the tracker file
+  itself can never be left half-written by an interrupted run.
+
+- **`quarantine/` folder.** If the script ever finds a complete backup on disk that isn't referenced by
+  `backups_tracker.json` (for example, an orphaned backup directory left over from an old crash, from before
+  this reconciliation logic existed), it does **not** delete it. Instead it moves the whole thing into
+  `<site>/quarantine/<name>` and logs a warning. Nothing in `quarantine/` is ever deleted automatically --
+  it is there for you to look at. If you're confident a quarantined item isn't needed (double check it's not
+  something you actually wanted, e.g. by peeking at its `files/` or `db/database.sql` contents or its
+  `messages.log`), it's safe to `rm -rf` it yourself. Conversely, if `backups_tracker.json` ever references a
+  stamp that has nothing on disk (e.g. it was quarantined out from under it, or manually removed), that
+  tracker entry is simply dropped.
+
+- **What a "reconciliation warning" email means.** Whenever any of the above cleanup actually happens
+  (a `.partial` item removed, a backup quarantined, or a stale tracker entry dropped), it's logged as a
+  warning and also folded into the run's notification email under a "Backup reconciliation warnings"
+  section -- even on a run that otherwise completes with no errors and no new backup needed. This is
+  informational, not necessarily an emergency: it means the script found and cleaned up after an
+  interruption on a *previous* run. When you get one, it's worth a quick look at the `quarantine/` folder
+  for the site(s) mentioned, but no action is strictly required beyond that.
 
 For more usage details, run ./sg_backup.py --help
