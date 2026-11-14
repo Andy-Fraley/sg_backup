@@ -1226,8 +1226,11 @@ def run_remote_command(client, command, timeout_secs, command_for_log=None):
                 received = True
             # exit_status_ready() means the exit status arrived (or the channel closed); eof_received means the
             # remote side has finished sending output (paramiko also sets it when the channel closes).
-            if channel.exit_status_ready() and channel.eof_received and not channel.recv_ready() \
-                    and not channel.recv_stderr_ready():
+            # 'channel.closed' is accepted as well as EOF: if the connection drops (or the server closes the
+            # channel without sending EOF first) eof_received may never become True, and without this we
+            # would sit polling a dead channel until the deadline instead of reporting the lost connection.
+            if channel.exit_status_ready() and (channel.eof_received or channel.closed) \
+                    and not channel.recv_ready() and not channel.recv_stderr_ready():
                 break
             if time.monotonic() >= deadline:
                 raise RemoteCommandTimeout(f"'{command_for_log}' did not finish within {timeout_secs} seconds")
