@@ -124,6 +124,11 @@ bad ones inherited from the seed. That one run per site is slower and reads ever
 uses the same single SSH login and only transfers the files that differ. Older zipped backups are not
 repaired.
 
+The rsync source is `public_html/` (the whole directory contents). It used to be `public_html/*`, which
+skipped top-level dotfiles such as `.htaccess` and stopped `--delete` from removing top-level files and
+directories that had been deleted from the site. Backups made before 2026-11-14 therefore lack top-level
+dotfiles and may contain top-level items that no longer existed on the site.
+
 ## Crash safety: partial backups, atomic tracker updates, and quarantine
 
 If a backup is interrupted part-way through (crash, power loss, kill), the script cleans up after itself

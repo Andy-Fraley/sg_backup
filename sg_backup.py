@@ -1019,6 +1019,14 @@ def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name)
     adds '--checksum' so rsync compares every file's content and re-fetches any that differ. That run reads
     every file on both ends (slower, more load on the host) but only transfers the files that differ.
 
+    Why the source is 'public_html/' and not 'public_html/*' (changed 2026-11-14): the '*' was expanded by
+    the remote shell, which does not match names starting with a dot, so top-level dotfiles such as
+    .htaccess were never backed up. It also meant '--delete' only applied inside the top-level directories
+    that were transferred, so a top-level file or directory removed from the site lived on in every later
+    backup through the seed. With the trailing-slash form rsync transfers the directory's whole contents,
+    dotfiles included, and '--delete' covers the top level too. The seed copy uses '<dir>/.' for the same
+    reason.
+
     SSH logins: exactly one (the single rsync), as before.
     """
     backup_dir = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name
@@ -1035,8 +1043,10 @@ def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name)
         if not is_zip_file(last_backup):
             last_backup_dir = g.backups_dir_path + '/' + site_name + '/' + last_backup
             last_backup_path = last_backup_dir + '/files'
-            # 'cp -a' (not 'cp -r') so modification times survive the copy -- see docstring.
-            copy_string = 'cp -a ' + last_backup_path + '/* ' + html_files_dir
+            # 'cp -a' (not 'cp -r') so modification times survive the copy -- see docstring. The source is
+            # '<dir>/.' rather than '<dir>/*' so top-level dotfiles (e.g. .htaccess) are seeded too; a shell
+            # '*' does not match names starting with a dot.
+            copy_string = 'cp -a ' + last_backup_path + '/. ' + html_files_dir
             logging.info(f'Copying files from {last_backup_path} to {html_files_dir} to accelerate rsync ' \
                           '(can take a while for large sites)')
             try:
@@ -1055,12 +1065,14 @@ def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name)
             'this one time; slower than usual)'
     logging.info(log_string)
     # No '--append' here, deliberately -- see docstring. '--checksum' only for the one-time repair run.
+    # The source is 'public_html/' (trailing slash = "the contents of this directory"), not 'public_html/*'
+    # -- see docstring.
     rsync_options = '--delete -aviz'
     if seed_needs_checksum:
         rsync_options = '--checksum ' + rsync_options
     rsync_string = '/usr/bin/rsync ' + rsync_options + ' -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
         str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + \
-        '/www/' + site_data['site_hostname'] + '/public_html/*" "' + html_files_dir + '"'
+        '/www/' + site_data['site_hostname'] + '/public_html/" "' + html_files_dir + '"'
     logging.debug(f'Executing: {rsync_string}')
     try:
         exec_output = subprocess.check_output(rsync_string, stderr=subprocess.STDOUT, shell=True)
