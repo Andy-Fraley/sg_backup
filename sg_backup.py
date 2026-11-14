@@ -41,6 +41,14 @@ TIMESTAMP_FORMAT = '%Y%m%d%H%M%S'
 # (see get_current_tracker_and_backups()) deletes anything found with this suffix.
 PARTIAL_SUFFIX = '.partial'
 
+# Name of an empty marker file written into a backup directory (next to 'files/', 'db/' and messages.log)
+# once its site files have been retrieved by an rsync that compares/transfers whole-file content, i.e. WITHOUT
+# the old '--append' flag. Backups made before 2026-11-14 used '--append', which could leave stale or
+# spliced files in 'files/' (see retrieve_html_files()), and they have no marker. When the backup used as the
+# rsync seed lacks this marker, retrieve_html_files() adds '--checksum' for that one run so any such bad
+# files inherited through the seed are detected and repaired; after that the marker keeps runs incremental.
+FILES_EXACT_MARKER = 'files_exact_copy.marker'
+
 # Name of the per-site subdirectory that reconciliation moves orphaned, unrecognized backups into (backups
 # found on disk with no corresponding backups_tracker.json entry) instead of deleting them outright, so a
 # human can inspect and decide what to do with them.
@@ -989,31 +997,68 @@ def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name)
     delta. Seeding into the partial path means a crash mid-copy (this can be a multi-GB copy for large
     sites) or mid-rsync leaves only an incomplete '.partial' directory behind, never something that looks
     like a finished backup.
+
+    Why rsync is NOT run with '--append' any more (stale-file problem found 2026-11-14): '--append' is only
+    for files that purely grow (logs). It decides by size alone and never looks at existing content: a
+    destination file that is the same size or larger than the source is skipped, and a shorter one just gets
+    the source's extra tail bytes glued on (with rsync >= 3.0 on both ends the old part is not verified).
+    Because the destination here is a seed copied from the previous backup, any file edited in place on the
+    site -- which is how WordPress core/plugin/theme updates and config edits behave -- was stored as last
+    time's version (same size or shrunk) or as a splice of old beginning + new end (grown). Without
+    '--append', rsync uses its normal check (size + modification time) and its normal delta transfer, which
+    always leaves the destination file identical to the source.
+
+    Why the seed is copied with 'cp -a' rather than 'cp -r': the normal rsync check needs the seed's
+    modification times to match the site's. 'cp -r' stamps every copied file with the current time, so
+    rsync would treat every file as changed and re-examine all of them on every run; 'cp -a' preserves the
+    times so only files that really changed are transferred.
+
+    One-time repair of older backups: a seed made by the old '--append' code may already contain stale or
+    spliced files, and a spliced file has the right size and time, so the normal check would keep it for
+    ever. Backups made by this code carry a FILES_EXACT_MARKER file; if the seed backup has none, this run
+    adds '--checksum' so rsync compares every file's content and re-fetches any that differ. That run reads
+    every file on both ends (slower, more load on the host) but only transfers the files that differ.
+
+    SSH logins: exactly one (the single rsync), as before.
     """
-    html_files_dir = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name + '/files'
+    backup_dir = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name
+    html_files_dir = backup_dir + '/files'
     assert(os.path.isdir(html_files_dir))
     # Seed the target /files directory with files from the last backup to drastically reduce rsync
     # retrieval data and time
     first_rsync = True
+    # True when the seed came from a backup without FILES_EXACT_MARKER (made by the old '--append' code), so
+    # its content cannot be trusted on size + time alone and must be compared by checksum this once.
+    seed_needs_checksum = False
     if existing_backups is not None and len(existing_backups) > 1:
         last_backup = existing_backups[-1][1]
         if not is_zip_file(last_backup):
-            last_backup_path = g.backups_dir_path + '/' + site_name + '/' + last_backup + '/files'
-            copy_string = 'cp -r ' + last_backup_path + '/* ' + html_files_dir
+            last_backup_dir = g.backups_dir_path + '/' + site_name + '/' + last_backup
+            last_backup_path = last_backup_dir + '/files'
+            # 'cp -a' (not 'cp -r') so modification times survive the copy -- see docstring.
+            copy_string = 'cp -a ' + last_backup_path + '/* ' + html_files_dir
             logging.info(f'Copying files from {last_backup_path} to {html_files_dir} to accelerate rsync ' \
                           '(can take a while for large sites)')
             try:
                 exec_output = subprocess.check_output(copy_string, stderr=subprocess.STDOUT, shell=True)
             except subprocess.CalledProcessError as e:
-                err_string = 'cp exited with error status ' + str(e.returncode) + ' and error: ' + e.output
+                err_string = 'cp exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
                 logging.error(err_string)
                 raise Exception(err_string)
             first_rsync = False
+            seed_needs_checksum = not os.path.isfile(last_backup_dir + '/' + FILES_EXACT_MARKER)
     log_string = f'Starting HTML file retrieval using rsync for site {site_name} to {html_files_dir}'
     if first_rsync:
         log_string += ' (can take a while since this is first rsync retrieval)'
+    elif seed_needs_checksum:
+        log_string += ' (previous backup predates the --append fix, so every file is compared by checksum ' \
+            'this one time; slower than usual)'
     logging.info(log_string)
-    rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
+    # No '--append' here, deliberately -- see docstring. '--checksum' only for the one-time repair run.
+    rsync_options = '--delete -aviz'
+    if seed_needs_checksum:
+        rsync_options = '--checksum ' + rsync_options
+    rsync_string = '/usr/bin/rsync ' + rsync_options + ' -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
         str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + \
         '/www/' + site_data['site_hostname'] + '/public_html/*" "' + html_files_dir + '"'
     logging.debug(f'Executing: {rsync_string}')
@@ -1023,6 +1068,9 @@ def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name)
         rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
         logging.error(rsync_err_string)
         raise Exception(rsync_err_string)
+    # rsync succeeded without '--append', so 'files' now matches the site. Record that, so the next run can
+    # trust this backup as a seed and skip the slow checksum comparison.
+    Path(backup_dir + '/' + FILES_EXACT_MARKER).touch()
     logging.info(f'Completed HTML file using rsync retrieval for site {site_name} to {html_files_dir}')
 
 

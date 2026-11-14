@@ -107,6 +107,23 @@ emails.  And the notify_target parameter is the email address you want notificat
 account must have an app password configured (requires establishment of 2-factor authentication on the account you want
 to use for emails) and used as the password here.
 
+## Site files: why rsync runs without `--append`
+
+Until November 2026 the site files were retrieved with `rsync --append` into a copy of the previous backup.
+`--append` is meant only for files that purely grow: it skips any file whose backup copy is the same size or
+larger, and for a shorter copy it only adds the extra bytes on the end, without checking the existing content.
+A file edited in place on the site (WordPress core/plugin/theme updates, config edits) was therefore stored
+as the previous version, or as a mix of the old beginning and the new end. Backups made before this fix can
+contain such files.
+
+The script now runs rsync without `--append` and seeds with `cp -a` (which keeps modification times, so
+rsync still only transfers what changed). Each backup made this way contains an empty
+`files_exact_copy.marker` file next to `files/`. When the previous backup has no marker (i.e. it was made by
+the old code), the next run adds `--checksum` once, so rsync compares every file's content and repairs any
+bad ones inherited from the seed. That one run per site is slower and reads every file on the host, but
+uses the same single SSH login and only transfers the files that differ. Older zipped backups are not
+repaired.
+
 ## Crash safety: partial backups, atomic tracker updates, and quarantine
 
 If a backup is interrupted part-way through (crash, power loss, kill), the script cleans up after itself
