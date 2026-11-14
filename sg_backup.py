@@ -1142,7 +1142,12 @@ def dump_db(site_name, site_data, backup_dir_name):
         check_mysqldump_result(site_name, exit_status, scrub_secret(stderr_text, mysql_password))
         logging.debug(f'mysqldump finished OK; dump is at {remote_dump_path} on server. Will do rsync to retrieve it')
 
-        rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
+        # No '--append' here, deliberately. The destination is a brand-new '<stamp>.partial/db' directory, so
+        # the flag never had any effect -- but if a leftover database.sql were ever present (e.g. a future
+        # retry reusing the directory), '--append' would keep it or splice the new dump's tail onto it, and
+        # verify_db_dump_complete() below would not notice because such a file still ends with the trailer.
+        # See retrieve_html_files() for the full explanation of what '--append' does.
+        rsync_string = '/usr/bin/rsync --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
             '" "' + str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':' + remote_dump_path + \
             '" "' + db_dump_filename + '"'
         logging.debug(f'Executing: {rsync_string}')
