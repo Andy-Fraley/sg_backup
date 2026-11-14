@@ -26,6 +26,7 @@ import io
 import smtplib
 import errno
 import zipfile
+import time
 
 
 app = typer.Typer()
@@ -44,6 +45,53 @@ PARTIAL_SUFFIX = '.partial'
 # found on disk with no corresponding backups_tracker.json entry) instead of deleting them outright, so a
 # human can inspect and decide what to do with them.
 QUARANTINE_DIRNAME = 'quarantine'
+
+# --- Database dump settings ---------------------------------------------------------------------------------------
+# Background (truncation incident found 2026-11-14): dump_db() used to start mysqldump over SSH and immediately
+# rsync the remote dump file back without waiting for mysqldump to finish, so most stored database.sql files were
+# silently truncated part-way through, and retention then rotated older complete dumps out. dump_db() now waits for
+# mysqldump to exit, checks its exit status and stderr, and verifies the retrieved file ends with mysqldump's
+# completion trailer before the backup is allowed to count. The constants below support that.
+
+# Upper bound on how long we wait for the remote mysqldump to finish. Generous on purpose (the largest site's dump
+# is ~100+ MB and SiteGround shared hosting can be slow) -- this exists only so a hung dump cannot block the whole
+# weekly job forever. Hitting it is treated as a failed dump for that site.
+MYSQLDUMP_TIMEOUT_SECS = 900
+
+# Upper bound for short housekeeping commands run over the already-open SSH connection (removing the remote temp
+# dump file, the 'ls' used by --ssh-test).
+REMOTE_SHORT_COMMAND_TIMEOUT_SECS = 120
+
+# How often run_remote_command() polls the SSH channel for output / exit status while a command runs, and how many
+# bytes it reads per recv call.
+REMOTE_POLL_INTERVAL_SECS = 0.5
+REMOTE_READ_CHUNK_BYTES = 32768
+
+# Extra mysqldump options (see dump_db() for how they are used):
+#   --single-transaction  consistent snapshot of InnoDB tables (all WordPress tables are InnoDB) without
+#                         LOCK TABLES, so the live site is not blocked while dumping and we do not need the LOCK
+#                         TABLES privilege, which shared hosting may not grant.
+#   --quick               stream rows to the output instead of buffering whole tables in memory (already the
+#                         default via --opt, but stated explicitly because large tables rely on it).
+#   --no-tablespaces      MySQL 5.7.31+/8.0.21+ need the PROCESS privilege to dump tablespace info and print an
+#                         "Access denied; you need (at least one of) the PROCESS privilege(s)" error without it on
+#                         shared hosting. Since stderr errors now fail the dump, skip tablespaces (WordPress does
+#                         not use them).
+#   --default-character-set=utf8mb4  so 4-byte characters (e.g. emoji in posts/comments) are not mangled.
+MYSQLDUMP_OPTIONS = '--single-transaction --quick --no-tablespaces --default-character-set=utf8mb4'
+
+# mysqldump writes this comment as (nearly) the last line of a dump that ran to completion, e.g.
+# "-- Dump completed on 2026-11-15  2:31:07". A dump that was cut off part-way does not have it. Only the tail of
+# the file is read to look for it (dumps are 100+ MB).
+DB_DUMP_TRAILER = b'-- Dump completed'
+DB_DUMP_TRAILER_TAIL_BYTES = 1024
+
+# Classification of mysqldump stderr lines (see check_mysqldump_result()). Warning lines are checked FIRST so that,
+# e.g., "mysqldump: [Warning] Using a password on the command line interface can be insecure." (printed on every
+# run because the password is passed with -p) is never mistaken for an error.
+MYSQLDUMP_STDERR_WARNING_RE = re.compile(r'^\s*(mysqldump:\s*)?warning\b|\[warning\]|using a password on the '
+                                         r'command line interface can be insecure', re.IGNORECASE)
+MYSQLDUMP_STDERR_ERROR_RE = re.compile(r"error|got errno|couldn't|access denied|unknown", re.IGNORECASE)
 
 # Intervals are slightly less than stated backup interval to allow for jitter of cron kickoff timing.
 # These are 'Live' backup intervals below.  Comment these out and use artificially short test intervals below
@@ -92,6 +140,28 @@ class g:
     # through process() first (e.g. a test harness) can detect and initialize it lazily instead of silently
     # sharing one mutable list across unrelated runs.
     reconciliation_warnings = None
+    # Names of sites whose database dump failed this run (see DbDumpError / do_backup()). Those sites were
+    # skipped (no new backup recorded, no retention run) while the remaining sites were still processed. Used
+    # to put a summary in the admin email and to make the process exit non-zero. Reset to [] in process().
+    failed_sites = None
+
+
+class DbDumpError(Exception):
+    """
+    Raised when a site's database dump is known to be bad or incomplete: mysqldump exited non-zero, reported an
+    error on stderr, did not finish within MYSQLDUMP_TIMEOUT_SECS, or the retrieved file is missing, empty or
+    lacks mysqldump's '-- Dump completed' trailer.
+
+    This is deliberately a separate exception type from connection/rsync failures. A DbDumpError fails only that
+    one site (it is caught in do_backup_if_time() / process() and the run continues with the next site), whereas
+    SSH connect/authentication failures, SSH transport errors and rsync failures are left unhandled so they go to
+    except_hook() and stop the whole run: if SiteGround is refusing or blocking us, opening connections for every
+    remaining site is exactly the behaviour that has previously got the home IP blocked.
+    """
+
+
+class RemoteCommandTimeout(Exception):
+    """Raised by run_remote_command() when a remote command did not finish within its time limit."""
 
 
 @app.command()
@@ -137,6 +207,7 @@ def process(
     g.datetime_start = datetime.datetime.now()
     g.datetime_start_string = g.datetime_start.strftime(TIMESTAMP_FORMAT)
     g.reconciliation_warnings = []  # Fresh per run; populated by get_current_tracker_and_backups() below
+    g.failed_sites = []  # Fresh per run; populated by do_backup() when a site's DB dump fails (DbDumpError)
 
     # Grab directoy path to backups
     if backups_dir:
@@ -270,7 +341,12 @@ def process(
     elif backup_now:
         for site_name in sites_data:
             site_data = sites_data[site_name]
-            do_backup(site_name, site_data)
+            try:
+                do_backup(site_name, site_data)
+            except DbDumpError:
+                # Already logged at ERROR and recorded in g.failed_sites by do_backup(). Only a bad/incomplete
+                # dump is handled here; connection and rsync failures still propagate and stop the run.
+                continue
 
     # It not a "now" (--backup-now) backup, then do the backups if enough time has transpired that a new backup
     # is required per site backup schedules
@@ -286,8 +362,10 @@ def process(
         # reconciliation found and cleaned up a problem (leftover .partial artifact, orphaned backup
         # quarantined, stale tracker entry dropped) during those do_backup_if_time() calls, that warning
         # needs to reach the admin even though no new backup was taken. So only take the early exit when
-        # there's nothing -- backup or warning -- worth emailing about.
-        if not g.did_a_backup and not g.reconciliation_warnings:
+        # there's nothing -- backup or warning -- worth emailing about. A failed site (DbDumpError) does not set
+        # g.did_a_backup, so it must also be checked here or a run whose only event was a failed dump would
+        # exit silently without emailing anyone.
+        if not g.did_a_backup and not g.reconciliation_warnings and not g.failed_sites:
             exit(0)
 
     du_string = '/usr/bin/du -d 2 -h ' + g.backups_dir_path
@@ -298,6 +376,14 @@ def process(
         logging.info(f'Size of backups:\n{exec_output}')
     except subprocess.CalledProcessError as e:
         logging.error('du exited with error status ' + str(e.returncode) + ' and error: ' + e.output)
+
+    # Summarize failed sites in one ERROR line near the end of the email (each failure was also logged at
+    # ERROR when it happened). Logged at ERROR so EmailFilter captures it and send_admin_email() uses the
+    # "encountered errors" subject.
+    if g.failed_sites:
+        logging.error(f'Database dump FAILED for {len(g.failed_sites)} site(s): {", ".join(g.failed_sites)}. '
+            'These sites were NOT backed up this run (no new backup recorded, older backups left untouched); '
+            'see the ERROR lines above for the reason.')
 
     error_string = g.string_stream.getvalue()
 
@@ -313,6 +399,11 @@ def process(
 
     if error_string:
         send_admin_email(error_string)
+
+    # Exit non-zero (after the email has gone out) if any site failed, so sg_backup.service shows as failed in
+    # systemd instead of Result=success. Before this, a run that stored truncated dumps exited 0.
+    if g.failed_sites:
+        sys.exit(1)
 
 
 class EmailFilter(logging.Filter):
@@ -432,7 +523,8 @@ def get_current_tracker_and_backups(site_name):
             if not is_partial_name(entry.name):
                 continue
             warning = f"Site '{site_name}': removing leftover in-progress artifact '{entry.name}' " \
-                '(it belongs to a backup or compression that was interrupted before it finished).'
+                '(it belongs to a backup or compression that was interrupted, or whose database dump failed, ' \
+                'before it finished).'
             logging.warning(warning)
             g.reconciliation_warnings.append(warning)
             try:
@@ -580,7 +672,15 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
 
     # Actually do the backup, retrieving WordPress DB and set of HTML files
     if do_new_backup:
-        do_backup(site_name, site_data, existing_backups)
+        try:
+            do_backup(site_name, site_data, existing_backups)
+        except DbDumpError:
+            # The dump for this site was bad/incomplete (already logged at ERROR and recorded in g.failed_sites
+            # by do_backup()). Return BEFORE touching the tracker or running retention: the failed backup must
+            # not be recorded, and it must never cause an older (possibly the only complete) backup to be
+            # deleted or rotated out. Its '<stamp>.partial' directory is left for the next run's reconciliation
+            # to discard. The caller then carries on with the remaining sites.
+            return
         g.did_a_backup = True
     else:
         logging.info(f'No backups to do for site {site_name}')
@@ -730,16 +830,28 @@ def get_current_backups_tracker(site_name):
     
 
 def ssh_test(site_name, site_data):
+    """
+    --ssh-test: open one SSH connection to the site, run 'ls', and report success/failure.
+
+    Uses run_remote_command() so the test actually waits for 'ls' to finish and checks its exit status (it used
+    to fire 'ls' without waiting, so "succeeded" only meant the login worked), and always closes the connection
+    instead of leaving it open until the process exits. Still exactly one SSH login per site.
+    """
     logging.info(f'Testing SSH connection to site {site_name}')
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     try:
         client.connect(site_data['ssh_hostname'], username=site_data['ssh_username'], port=int(site_data['ssh_port']))
-        msg = [stdin, stdout, stderr] = client.exec_command('ls')
-    except:
+        exit_status, _stdout_text, _stderr_text = run_remote_command(client, 'ls', REMOTE_SHORT_COMMAND_TIMEOUT_SECS)
+        if exit_status != 0:
+            raise Exception(f"'ls' exited with status {exit_status}")
+    except Exception as e:
+        logging.debug(f'SSH test failure detail for site {site_name}: {e}')
         logging.info(f'SSH test *** FAILED *** for site {site_name}!')
         g.ssh_test_failure = True
         return
+    finally:
+        client.close()
     logging.info(f'SSH test succeeded for site {site_name}!')
 
 
@@ -756,6 +868,11 @@ def do_backup(site_name, site_data, existing_backups=None):
     timestamp name that looks complete but isn't. get_current_tracker_and_backups() deletes any such
     leftover '.partial' directory it finds at the start of the next run, so an interrupted backup cleans
     itself up automatically instead of requiring human intervention.
+
+    Failed database dump: if dump_db() raises DbDumpError (bad/incomplete dump), this logs it at ERROR,
+    records the site in g.failed_sites, skips the site-files rsync, detaches the per-backup log handler and
+    re-raises without renaming '.partial' -- i.e. it is treated exactly like a crash for this one site. The
+    callers catch DbDumpError and continue with the next site. Any other exception propagates unchanged.
     """
     global g
 
@@ -790,7 +907,19 @@ def do_backup(site_name, site_data, existing_backups=None):
 
     logging.info(f'Starting backup for {site_name} (building at {partial_dir})')
     if site_data['do_mysql_backup']:
-        dump_db(site_name, site_data, partial_name)
+        try:
+            dump_db(site_name, site_data, partial_name)
+        except DbDumpError as e:
+            logging.error(f'Database dump FAILED for site {site_name}: {e}. This site was NOT backed up this run: '
+                'site files were not retrieved, no new backup was recorded and no older backups were deleted or '
+                f'compressed. The incomplete {partial_dir} is left in place; the next scheduled run removes it '
+                'automatically (after a --backup-now run, delete it by hand). Continuing with the remaining sites.')
+            g.failed_sites.append(site_name)
+            # Detach the per-backup log handler now, since the normal shutdown at the end of this function
+            # won't be reached; otherwise later sites' messages would also be written into this site's log.
+            file_handler.close()
+            logging.getLogger().removeHandler(file_handler)
+            raise
     retrieve_html_files(site_name, site_data, existing_backups, partial_name)
 
     # Everything succeeded -- promote the partial backup to its real, final name. Before this line, a crash
@@ -900,8 +1029,28 @@ def retrieve_html_files(site_name, site_data, existing_backups, backup_dir_name)
 def dump_db(site_name, site_data, backup_dir_name):
     """
     Dump the WordPress MySQL database for `site_name` over SSH (mysqldump run remotely, output redirected to
-    a temp file on the remote host), then rsync that dump back into
-    <site>/<backup_dir_name>/db/database.sql and delete the remote copy.
+    a temp file on the remote host), WAIT for mysqldump to finish and check its result, rsync that dump back
+    into <site>/<backup_dir_name>/db/database.sql, verify the retrieved file is complete, and finally delete
+    the remote copy.
+
+    Why the waiting and checking (truncation incident found 2026-11-14): this used to fire mysqldump and
+    immediately rsync whatever part of the file existed at that moment, so most stored dumps were truncated,
+    and nothing noticed. Now, in order:
+      1. mysqldump runs over one paramiko connection; we wait (bounded by MYSQLDUMP_TIMEOUT_SECS) for it to
+         exit, then check its exit status and stderr (check_mysqldump_result()).
+      2. The dump file is retrieved with rsync (a separate SSH login, as before).
+      3. The retrieved file must end with mysqldump's '-- Dump completed' trailer (verify_db_dump_complete()).
+    Only if all three pass is the dump considered good. Steps 1 and 3 raise DbDumpError on failure, which
+    fails just this site (see do_backup()). SSH connect/transport errors and rsync failures still raise
+    ordinary exceptions and stop the whole run, as before.
+
+    SSH logins per call stay exactly as before: one paramiko connection (used for mysqldump and for removing
+    the temp file) plus one rsync. No retries and no reconnects -- extra connections to SiteGround have
+    previously got the home IP blocked. If mysqldump itself fails, the rsync is skipped (one fewer login).
+
+    Whatever happens after mysqldump has been started, the remote temp dump is removed over the SAME open
+    connection (so database dumps are not left lying on the web host) and the connection is closed (it used
+    to stay open, idle, until the process exited).
 
     `backup_dir_name` is the in-progress backup's directory name -- normally '<stamp>.partial' (see
     do_backup()) -- so a crash here leaves the partial dump only under the not-yet-promoted '.partial'
@@ -909,46 +1058,202 @@ def dump_db(site_name, site_data, backup_dir_name):
     """
     global g
 
+    mysql_password = str(site_data['mysql_password'])
+    remote_dump_path = f"/home/{site_data['ssh_username']}/tmp/database.sql"
+    db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name + '/db/database.sql'
+
     logging.info(f'Starting database dump for site {site_name}')
     client = paramiko.SSHClient()
     client.load_system_host_keys()
+    # Connect/authentication errors are deliberately NOT caught: they go to except_hook() and stop the run.
     client.connect(site_data['ssh_hostname'], username=site_data['ssh_username'], port=int(site_data['ssh_port']))
-    mysqldump_string = f"mysqldump -u {site_data['mysql_user']} -p{site_data['mysql_password']} " \
-        f"{site_data['mysql_db']} >/home/{site_data['ssh_username']}/tmp/database.sql"
-    mysqldump_string_star = f"mysqldump -u {site_data['mysql_user']} -p***** " \
-        f"{site_data['mysql_db']} >/home/{site_data['ssh_username']}/tmp/database.sql"
-    logging.debug(f"Executing this command over SSH: '{mysqldump_string_star}'")
-    msg = [stdin, stdout, stderr] = client.exec_command(mysqldump_string)
-    logging.debug(f'DB dump now under /tmp on server. Will do rsync to retrieve it')
-    db_dump_filename = g.backups_dir_path + '/' + site_name + '/' + backup_dir_name + '/db/database.sql'
-    rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + '" "' + \
-        str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':/home/' + site_data['ssh_username'] + \
-        '/tmp/database.sql' + '" "' + db_dump_filename + '"'
-    logging.debug(f'Executing: {rsync_string}')
     try:
-        exec_output = subprocess.check_output(rsync_string, stderr=subprocess.STDOUT, shell=True)
-    except subprocess.CalledProcessError as e:
-        rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + str(e.output)
-        logging.error(rsync_err_string)
-        raise Exception(rsync_err_string)
-    logging.debug(f'DB dump retrieved. Now delete on server.')
-    rm_string = f"rm /home/{site_data['ssh_username']}/tmp/database.sql"
-    logging.debug(f"Executing this command over SSH: '{rm_string}'")
-    msg = [stdin, stdout, stderr] = client.exec_command(rm_string)
-    logging.debug(f'DB dump deleted on server.')
+        # Credentials are passed exactly as before (see README / follow-ups); only options were added.
+        mysqldump_string = f"mysqldump {MYSQLDUMP_OPTIONS} -u {site_data['mysql_user']} -p{mysql_password} " \
+            f"{site_data['mysql_db']} >{remote_dump_path}"
+        # Never log the real password -- log this starred version of the command instead.
+        mysqldump_string_star = f"mysqldump {MYSQLDUMP_OPTIONS} -u {site_data['mysql_user']} -p***** " \
+            f"{site_data['mysql_db']} >{remote_dump_path}"
+        try:
+            exit_status, _stdout_text, stderr_text = run_remote_command(client, mysqldump_string,
+                MYSQLDUMP_TIMEOUT_SECS, command_for_log=mysqldump_string_star)
+        except RemoteCommandTimeout:
+            raise DbDumpError(f'mysqldump did not finish within {MYSQLDUMP_TIMEOUT_SECS} seconds')
+        check_mysqldump_result(site_name, exit_status, scrub_secret(stderr_text, mysql_password))
+        logging.debug(f'mysqldump finished OK; dump is at {remote_dump_path} on server. Will do rsync to retrieve it')
+
+        rsync_string = '/usr/bin/rsync --append --delete -aviz -e "ssh -p ' + str(site_data['ssh_port']) + \
+            '" "' + str(site_data['ssh_username']) + '@' + site_data['ssh_hostname'] + ':' + remote_dump_path + \
+            '" "' + db_dump_filename + '"'
+        logging.debug(f'Executing: {rsync_string}')
+        try:
+            exec_output = subprocess.check_output(rsync_string, stderr=subprocess.STDOUT, shell=True)
+        except subprocess.CalledProcessError as e:
+            # rsync failure keeps its historical behaviour: an unhandled exception that stops the run.
+            rsync_err_string = 'rsync exited with error status ' + str(e.returncode) + ' and error: ' + \
+                str(e.output)
+            logging.error(rsync_err_string)
+            raise Exception(rsync_err_string)
+        logging.debug(f'DB dump retrieved. Verifying it is complete.')
+
+        verify_db_dump_complete(db_dump_filename)
+    finally:
+        # Runs on success (after the completeness check), on DbDumpError and on any other exception. It never
+        # raises, so it cannot turn a good dump into a failure or mask the original error.
+        remove_remote_file(client, remote_dump_path, site_name)
+        client.close()
+
     logging.info(f'Completed database dump for site {site_name} to {db_dump_filename}')
 
 
-def ssh(client, cmd):
-    out = []
-    msg = [stdin, stdout, stderr] = client.exec_command(cmd)
-    for item in msg:
-        try:
-            for line in item:
-                out.append(line)
-                logging.debug(f'Received line: {line}')
-        except: pass
-    return(list(out))
+def check_mysqldump_result(site_name, exit_status, stderr_text):
+    """
+    Decide whether a finished mysqldump run succeeded; raise DbDumpError if not.
+
+    `stderr_text` must already have the MySQL password scrubbed out (see scrub_secret()), since stderr lines
+    are logged. The dump fails if the exit status is non-zero, or if any stderr line looks like an error
+    (MYSQLDUMP_STDERR_ERROR_RE). Lines that are clearly warnings (MYSQLDUMP_STDERR_WARNING_RE, e.g. the
+    "Using a password on the command line interface can be insecure" line printed on every run) are logged at
+    WARNING and do not fail the dump. Any other unexpected stderr text is also logged at WARNING but does not
+    by itself fail the dump -- the exit status and the '-- Dump completed' trailer check are the backstop.
+    """
+    error_lines = []
+    for line in stderr_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if MYSQLDUMP_STDERR_WARNING_RE.search(line):
+            logging.warning(f'mysqldump warning for site {site_name}: {line}')
+        elif MYSQLDUMP_STDERR_ERROR_RE.search(line):
+            error_lines.append(line)
+        else:
+            logging.warning(f'mysqldump printed unexpected output on stderr for site {site_name}: {line}')
+
+    reasons = []
+    if exit_status != 0:
+        reasons.append(f'mysqldump exited with status {exit_status}')
+    if error_lines:
+        reasons.append('mysqldump reported error(s): ' + ' | '.join(error_lines))
+    if reasons:
+        raise DbDumpError('; '.join(reasons))
+
+
+def verify_db_dump_complete(dump_path):
+    """
+    Raise DbDumpError unless the retrieved dump file at `dump_path` exists, is non-empty and its last
+    DB_DUMP_TRAILER_TAIL_BYTES bytes contain mysqldump's '-- Dump completed' trailer.
+
+    The trailer is what actually proves completeness: truncated dumps found 2026-11-14 had plausible-looking
+    sizes, so a size check alone would not have caught them. Only the tail is read, since dumps are 100+ MB.
+    """
+    if not os.path.isfile(dump_path):
+        raise DbDumpError(f'retrieved dump file {dump_path} does not exist')
+    size = os.path.getsize(dump_path)
+    logging.info(f'Retrieved database dump {dump_path} is {size:,} bytes')
+    if size == 0:
+        raise DbDumpError(f'retrieved dump file {dump_path} is empty')
+    with open(dump_path, 'rb') as dump_file:
+        dump_file.seek(max(0, size - DB_DUMP_TRAILER_TAIL_BYTES))
+        tail = dump_file.read()
+    if DB_DUMP_TRAILER not in tail:
+        raise DbDumpError(f"retrieved dump file {dump_path} ({size:,} bytes) does not end with mysqldump's "
+            f"'{DB_DUMP_TRAILER.decode()}' trailer, so it is incomplete (truncated)")
+
+
+def remove_remote_file(client, remote_path, site_name):
+    """
+    Remove `remote_path` on the server over the already-open paramiko `client` ('rm -f', waiting for it to
+    finish). Returns True on success, False on failure.
+
+    Never raises: it runs in dump_db()'s finally block, so a failure here must neither turn a good dump into a
+    failed backup nor mask the original dump failure. A failure is logged at ERROR so the admin email flags
+    that a database dump may have been left on the web host. Never opens a new connection: if the existing
+    one is already gone, it just reports that.
+    """
+    try:
+        transport = client.get_transport()
+        if transport is None or not transport.is_active():
+            logging.error(f'Could not remove database dump {remote_path} from server for site {site_name}: the '
+                'SSH connection is already closed. Please delete it manually.')
+            return False
+        exit_status, _stdout_text, stderr_text = run_remote_command(client, f'rm -f {remote_path}',
+            REMOTE_SHORT_COMMAND_TIMEOUT_SECS)
+        if exit_status != 0:
+            logging.error(f'Could not remove database dump {remote_path} from server for site {site_name}: rm '
+                f'exited with status {exit_status}: {stderr_text.strip()}. Please delete it manually.')
+            return False
+    except Exception as e:
+        logging.error(f'Could not remove database dump {remote_path} from server for site {site_name}: {e}. '
+            'Please delete it manually.')
+        return False
+    logging.debug(f'DB dump {remote_path} deleted on server.')
+    return True
+
+
+def run_remote_command(client, command, timeout_secs, command_for_log=None):
+    """
+    Run `command` over the already-connected paramiko `client`, wait for it to finish and return
+    (exit_status, stdout_text, stderr_text).
+
+    paramiko's exec_command() returns as soon as the command has *started*; that is how the 2026-11-14 dump
+    truncation happened. This helper polls the channel, draining stdout and stderr as data arrives (so a
+    command that writes a lot to one stream cannot fill the SSH window and deadlock while we wait on the
+    other), until the remote process has exited and both streams are at EOF. Only then is
+    recv_exit_status() called, which paramiko warns can hang if called before the output has been read.
+
+    Raises RemoteCommandTimeout if the command has not finished within `timeout_secs` (the overall
+    deadline, not per read). Raises paramiko.SSHException if the SSH connection dropped before an exit status
+    was received (a transport error, which callers deliberately do not treat as a mere dump failure).
+    `command_for_log` is logged instead of `command` (use it to avoid logging passwords). The channel is
+    always closed afterwards; the connection itself is left open for the caller to reuse and close.
+    """
+    if command_for_log is None:
+        command_for_log = command
+    logging.debug(f"Executing this command over SSH: '{command_for_log}'")
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout_secs)
+    channel = stdout.channel
+    stdout_chunks = []
+    stderr_chunks = []
+    deadline = time.monotonic() + timeout_secs
+    try:
+        while True:
+            received = False
+            while channel.recv_ready():
+                stdout_chunks.append(channel.recv(REMOTE_READ_CHUNK_BYTES))
+                received = True
+            while channel.recv_stderr_ready():
+                stderr_chunks.append(channel.recv_stderr(REMOTE_READ_CHUNK_BYTES))
+                received = True
+            # exit_status_ready() means the exit status arrived (or the channel closed); eof_received means the
+            # remote side has finished sending output (paramiko also sets it when the channel closes).
+            if channel.exit_status_ready() and channel.eof_received and not channel.recv_ready() \
+                    and not channel.recv_stderr_ready():
+                break
+            if time.monotonic() >= deadline:
+                raise RemoteCommandTimeout(f"'{command_for_log}' did not finish within {timeout_secs} seconds")
+            if not received:
+                time.sleep(REMOTE_POLL_INTERVAL_SECS)
+        exit_status = channel.recv_exit_status()
+        # paramiko reports -1 when the channel closed without an exit status; if the whole connection is gone,
+        # that is a dropped connection, not a command failure.
+        transport = client.get_transport()
+        if exit_status == -1 and (transport is None or not transport.is_active()):
+            raise paramiko.SSHException(f"SSH connection was lost while running '{command_for_log}'")
+    finally:
+        channel.close()
+    stdout_text = b''.join(stdout_chunks).decode('utf-8', errors='replace')
+    stderr_text = b''.join(stderr_chunks).decode('utf-8', errors='replace')
+    return (exit_status, stdout_text, stderr_text)
+
+
+def scrub_secret(text, secret):
+    """
+    Return `text` with every occurrence of `secret` replaced by '*****', so that remote output (which might
+    echo the command line, including the MySQL password) can be logged and emailed safely.
+    """
+    if not secret:
+        return text
+    return text.replace(secret, '*****')
 
 
 def except_hook(type,value,traceback):

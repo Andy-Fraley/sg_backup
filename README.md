@@ -1,8 +1,9 @@
 # sg_backup
 Utility to backup websites hosted on SiteGround.com
 
-This backup utility pulls from SiteGround by running an ssh mysqldump into a local file to collect WordPress database
-and by running an rsync against the next-oldest backup (if one exists, else use rsync to populate new) for website
+This backup utility pulls from SiteGround by running mysqldump over ssh into a temp file on the server (waiting for
+it to finish and verifying the result -- see "Database dump verification" below), retrieving that file with rsync to
+collect the WordPress database, and by running an rsync against the next-oldest backup (if one exists, else use rsync to populate new) for website
 files.  It leaves the newest backup unzipped (as rsync target for next backup to significantly speed up rsync file
 transfers) and zips all non-newest backups to save on local disk space.
 
@@ -145,5 +146,38 @@ conventions worth understanding if you're ever poking around in the backups dire
   informational, not necessarily an emergency: it means the script found and cleaned up after an
   interruption on a *previous* run. When you get one, it's worth a quick look at the `quarantine/` folder
   for the site(s) mentioned, but no action is strictly required beyond that.
+
+## Database dump verification and failed sites
+
+Until November 2026 the script started mysqldump on the server and immediately rsync'd the dump file back without
+waiting for mysqldump to finish, so most stored `db/database.sql` files were silently truncated. The dump step now:
+
+1. Runs `mysqldump --single-transaction --quick --no-tablespaces --default-character-set=utf8mb4 ...` over one SSH
+   connection and **waits** for it to exit (at most `MYSQLDUMP_TIMEOUT_SECS`, 15 minutes). The dump fails if
+   mysqldump exits non-zero, times out, or prints an error on stderr. Warnings on stderr (such as the usual "Using a
+   password on the command line interface can be insecure") are only logged.
+2. Retrieves the dump with rsync, as before.
+3. Checks that the retrieved file is non-empty and ends with mysqldump's `-- Dump completed` trailer.
+4. Removes the temp dump from the server (also when the dump failed) over the same SSH connection, then closes it.
+   No extra SSH connections are made and nothing is retried.
+
+If the dump for a site fails, **only that site** is skipped for this run: its site files are not retrieved, its
+`<stamp>.partial` directory is not promoted, nothing is added to its `backups_tracker.json`, and none of its older
+backups are deleted or compressed (so a bad dump can never rotate out a good backup). The remaining sites are still
+backed up. The notification email has the "encountered errors" subject, an ERROR line naming the site and reason,
+and a summary line listing all failed sites; the process exits with status 1 so the systemd service shows as
+failed. The next scheduled run removes the leftover `<stamp>.partial` directory (reported as a reconciliation
+warning) and, since no backup was recorded, takes a new backup of that site.
+
+SSH connection/authentication failures and rsync failures are different: they still stop the whole run immediately
+(and send the error email), so the script does not keep opening connections to a host that is refusing or blocking
+it.
+
+To back up a single site on demand, combine `--backup-now` with `--backup-site <site_name>` and a `--backups-dir`
+outside the normal backups directory (the directory must already exist). A `--backup-now` backup is never recorded
+in any `backups_tracker.json` and never triggers retention deletion or compression; it is a full (not seeded) rsync
+of the site files. Do not point `--backup-now` at the scheduled backups directory: the next scheduled run would
+find the untracked backup and move it into `quarantine/`. A `--backup-now` run also does not clean up `.partial`
+directories, so if a dump fails there, delete its `<stamp>.partial` directory by hand.
 
 For more usage details, run ./sg_backup.py --help
