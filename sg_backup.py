@@ -200,6 +200,13 @@ def process(
             "site2) or all (default) websites listed in vault.yml are backed up to the --backups_dir target " \
             "directory now independent of specified backup intervals in vault.yml.  In fact, websites without "
             "a backup schedule can only be backed up using this --backup-now flag.")] = False,
+        force_backup: Annotated[bool, typer.Option("--force-backup", help="Do a normal scheduled-style backup " \
+            "right now for the site(s) named with --backup-site, even though no backup interval says one is due " \
+            "yet. Unlike --backup-now, the backup is made in the regular --backups-dir, is seeded from the " \
+            "previous backup, is recorded in backups_tracker.json (under the site's shortest backup interval) " \
+            "and is followed by the usual retention and compression. Because it counts as the newest backup " \
+            "for that interval, the next scheduled run may find the site not yet due. Requires --backup-site; " \
+            "cannot be combined with --backup-now or --ssh-test.")] = False,
         test_ssh: Annotated[bool, typer.Option("--ssh-test", help="Cycle through all sites in vault.yml and test " \
             "SSH connectivity to each site.  Specifying subset of sites to test using --backup-site " \
             "parameters is fine.")] = False,
@@ -297,6 +304,18 @@ def process(
             logging.error(err_string)
             raise Exception(err_string)
 
+    # --force-backup must name its site(s) explicitly: forcing every site in the vault by accident would open
+    # a connection to every host, which is exactly the burst of SSH activity SiteGround has blocked us for.
+    if force_backup:
+        if not backup_site:
+            err_string = 'When --force-backup is specified, at least one --backup-site must also be given.'
+            logging.error(err_string)
+            raise Exception(err_string)
+        if backup_now or test_ssh:
+            err_string = '--force-backup cannot be combined with --backup-now or --ssh-test.'
+            logging.error(err_string)
+            raise Exception(err_string)
+
     # Log to central messages files in the backups directory
     if not os.path.isdir(g.backups_dir_path):
         raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), g.backups_dir_path)
@@ -363,7 +382,7 @@ def process(
         for site_name in sites_data:
             site_data = sites_data[site_name]
             backup_schedule = get_backup_schedule(site_data)
-            do_backup_if_time(site_name, site_data, backup_schedule)
+            do_backup_if_time(site_name, site_data, backup_schedule, force=force_backup)
 
         # Historically this exited immediately (skipping the notification email entirely) whenever no site
         # needed a new backup this run. That's still fine when nothing else happened -- but if startup
@@ -636,7 +655,16 @@ def write_backups_tracker(site_name, backups_tracker):
     os.replace(temp_path, final_path)
 
 
-def do_backup_if_time(site_name, site_data, backup_schedule):
+def do_backup_if_time(site_name, site_data, backup_schedule, force=False):
+    """
+    Do a backup of one site if any of its backup intervals says one is due, then run retention and compression.
+
+    force (set by --force-backup): do a backup now even if no interval is due. A forced backup goes through
+    exactly the same path as a due one (seeded from the previous backup, built under '<stamp>.partial', recorded
+    in the tracker, followed by retention and compression), so it is a genuine full backup that later runs and
+    other tools can rely on. When nothing was due, it is recorded only under the site's SHORTEST interval
+    (e.g. 'weekly'), so it does not use up a monthly/yearly retention slot or reset those longer clocks.
+    """
     # Never do backups for websites with no backup schedule in vault.yml
     if backup_schedule is None:
         logging.info(f'Site {site_name} does not have backup schedule.  Skipping timed backup for this site')
@@ -677,6 +705,15 @@ def do_backup_if_time(site_name, site_data, backup_schedule):
             else:
                 backups_tracker_new[backup_interval] = [g.datetime_start_string]
                 do_new_backup = True
+
+    # --force-backup: nothing was due, but the user asked for a backup of this site right now. Record it under
+    # the shortest scheduled interval only (see docstring).
+    if force and not do_new_backup:
+        shortest_interval = min(backup_schedule.keys(), key=lambda interval: BACKUP_INTERVALS[interval])
+        logging.info(f'Doing FORCED new backup for site {site_name} (--force-backup), recorded on '
+            f'{shortest_interval} schedule')
+        backups_tracker_new[shortest_interval] = [g.datetime_start_string]
+        do_new_backup = True
 
     # Actually do the backup, retrieving WordPress DB and set of HTML files
     if do_new_backup:
