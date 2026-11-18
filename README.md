@@ -204,9 +204,12 @@ directories, so if a dump fails there, delete its `<stamp>.partial` directory by
 
 To make an extra **regular** backup of a site before it is next due, use `--force-backup` with
 `--backup-site <site_name>` and the normal `--backups-dir`. The backup goes through the same path as a scheduled
-one: seeded from the previous backup, recorded in `backups_tracker.json` (under the site's shortest backup
-interval only), then the usual retention and compression. Because it becomes the newest backup for that interval,
-the next scheduled run may find the site not yet due and skip it. `--force-backup` requires `--backup-site` and
+one: seeded from the previous backup, recorded in `backups_tracker.json`, then the usual retention and
+compression. It is recorded in its own `forced` slot, not under `weekly`/`monthly`/`yearly`: only one forced
+backup is kept (each replaces the previous forced one), it does not use up a scheduled retention slot, and it
+does not change when the next scheduled backup is due. (If a scheduled interval happens to be due at that
+moment, the backup is an ordinary scheduled one and is recorded under that interval instead.)
+`--force-backup` requires `--backup-site` and
 cannot be combined with `--backup-now` or `--ssh-test`.
 
 For more usage details, run ./sg_backup.py --help

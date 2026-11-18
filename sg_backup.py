@@ -112,6 +112,13 @@ BACKUP_INTERVALS = {
     'hourly': datetime.timedelta(minutes=55)
 }
 
+# Tracker key under which --force-backup backups are recorded (see do_backup_if_time()). It is deliberately
+# NOT one of the BACKUP_INTERVALS: forced backups are extra copies that must not use up a weekly/monthly
+# retention slot or change when the next scheduled backup is due. Only the newest FORCED_BACKUPS_TO_KEEP are
+# kept, so each forced backup replaces the previous forced one.
+FORCED_TRACKER_KEY = 'forced'
+FORCED_BACKUPS_TO_KEEP = 1
+
 # These are VERY SHORT 'Test' mode intervals used to test backup timing and mechanics (rsync-in-place, archiving,
 # deletion).  Comment these out and uncomment backup intervals above to operate in 'Live' mode.
 #BACKUP_INTERVALS = {
@@ -203,9 +210,10 @@ def process(
         force_backup: Annotated[bool, typer.Option("--force-backup", help="Do a normal scheduled-style backup " \
             "right now for the site(s) named with --backup-site, even though no backup interval says one is due " \
             "yet. Unlike --backup-now, the backup is made in the regular --backups-dir, is seeded from the " \
-            "previous backup, is recorded in backups_tracker.json (under the site's shortest backup interval) " \
-            "and is followed by the usual retention and compression. Because it counts as the newest backup " \
-            "for that interval, the next scheduled run may find the site not yet due. Requires --backup-site; " \
+            "previous backup, is recorded in backups_tracker.json in its own 'forced' slot and is followed by " \
+            "the usual retention and compression. Only one forced backup is kept: each one replaces the " \
+            "previous forced backup, and it neither uses a weekly/monthly/yearly retention slot nor changes " \
+            "when the next scheduled backup is due. Requires --backup-site; " \
             "cannot be combined with --backup-now or --ssh-test.")] = False,
         test_ssh: Annotated[bool, typer.Option("--ssh-test", help="Cycle through all sites in vault.yml and test " \
             "SSH connectivity to each site.  Specifying subset of sites to test using --backup-site " \
@@ -662,8 +670,12 @@ def do_backup_if_time(site_name, site_data, backup_schedule, force=False):
     force (set by --force-backup): do a backup now even if no interval is due. A forced backup goes through
     exactly the same path as a due one (seeded from the previous backup, built under '<stamp>.partial', recorded
     in the tracker, followed by retention and compression), so it is a genuine full backup that later runs and
-    other tools can rely on. When nothing was due, it is recorded only under the site's SHORTEST interval
-    (e.g. 'weekly'), so it does not use up a monthly/yearly retention slot or reset those longer clocks.
+    other tools can rely on. When nothing was due, it is recorded in the tracker under FORCED_TRACKER_KEY
+    rather than under a scheduled interval. Only FORCED_BACKUPS_TO_KEEP (one) forced backup is kept, so each
+    forced backup replaces the previous one, and because it is not listed under 'weekly'/'monthly'/... it
+    neither uses up one of those retention slots nor resets their clocks: the next scheduled run decides
+    whether a backup is due exactly as if the forced one had never happened. (If an interval IS due when
+    --force-backup is given, the backup is simply a normal scheduled one and is recorded under that interval.)
     """
     # Never do backups for websites with no backup schedule in vault.yml
     if backup_schedule is None:
@@ -706,13 +718,12 @@ def do_backup_if_time(site_name, site_data, backup_schedule, force=False):
                 backups_tracker_new[backup_interval] = [g.datetime_start_string]
                 do_new_backup = True
 
-    # --force-backup: nothing was due, but the user asked for a backup of this site right now. Record it under
-    # the shortest scheduled interval only (see docstring).
+    # --force-backup: nothing was due, but the user asked for a backup of this site right now. Record it in
+    # the tracker's own FORCED_TRACKER_KEY slot (see docstring), not under a scheduled interval.
     if force and not do_new_backup:
-        shortest_interval = min(backup_schedule.keys(), key=lambda interval: BACKUP_INTERVALS[interval])
-        logging.info(f'Doing FORCED new backup for site {site_name} (--force-backup), recorded on '
-            f'{shortest_interval} schedule')
-        backups_tracker_new[shortest_interval] = [g.datetime_start_string]
+        logging.info(f'Doing FORCED new backup for site {site_name} (--force-backup), recorded in the '
+            f"'{FORCED_TRACKER_KEY}' slot (replaces the previous forced backup)")
+        backups_tracker_new[FORCED_TRACKER_KEY] = [g.datetime_start_string]
         do_new_backup = True
 
     # Actually do the backup, retrieving WordPress DB and set of HTML files
@@ -751,7 +762,11 @@ def do_backup_if_time(site_name, site_data, backup_schedule, force=False):
     set_of_backups_to_keep = set()
     backups_tracker_new = {}
     for backup_interval in backups_tracker_current:
-        num_backups_to_keep = site_data['backup_intervals'][backup_interval]
+        # The forced slot is not a vault-configured interval; it always keeps a fixed, small number.
+        if backup_interval == FORCED_TRACKER_KEY:
+            num_backups_to_keep = FORCED_BACKUPS_TO_KEEP
+        else:
+            num_backups_to_keep = site_data['backup_intervals'][backup_interval]
         backups_for_interval = backups_tracker_current[backup_interval]
         keep_list = backups_for_interval
         if num_backups_to_keep != 0 and len(backups_for_interval) > num_backups_to_keep:
